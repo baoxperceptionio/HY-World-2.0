@@ -29,10 +29,10 @@ https://github.com/user-attachments/assets/b56f4750-25c9-48fb-83ff-d58526711463
 
 ## 🔥 News
 
+- **[May 11, 2026]**: 🤗 Open-source ![Panorama Generation](https://img.shields.io/badge/Panorama_Generation-4285F4?style=flat-square) (HY-Pano 2.0) model weights & code!
 - **[April 16, 2026]**: 🚀 Release HY-World 2.0 technical report & partial codes!
 - **[April 16, 2026]**: 🤗 Open-source WorldMirror 2.0 inference code and model weights!
 - **[Coming Soon]**: Release Full HY-World 2.0 (World Generation) inference code.
-- **[May 11, 2026]**: 🤗 Open-source ![Panorama Generation](https://img.shields.io/badge/Panorama_Generation-4285F4?style=flat-square) (HY-Pano 2.0) model weights & code!
 - **[Coming Soon]**: Release ![Trajectory Planning](https://img.shields.io/badge/Trajectory_Planning-EA4335?style=flat-square)（WorldNav） code.
 - **[Coming Soon]**: Release ![World Expansion](https://img.shields.io/badge/World_Expansion-FBBC05?style=flat-square)(WorldStereo 2.0) model weights & inference code.
 
@@ -146,7 +146,8 @@ Existing world models, such as Genie 3, Cosmos, and HY-World 1.5 (WorldPlay+Worl
 
 | Model | Description | Params | Date | Hugging Face |
 |-------|-------------|--------|------|--------------|
-| HY-Pano-2 [new] | Text / image &rarr; 360° panorama | ~80B | 2026 | [Download](https://huggingface.co/tencent/HY-World-2.0/tree/main/HY-Pano-2.0) |
+| HY-Pano-2 [new] | Text / image → 360° panorama | ~80B | 2026 | [Download](https://huggingface.co/tencent/HY-World-2.0/tree/main/HY-Pano-2.0) |
+| HY-Pano-2-Qwen [new] | Text / image → 360° panorama | ~425M | 2026 | [Download](https://huggingface.co/tencent/HY-World-2.0/blob/main/HY-Pano-2.0/pytorch_lora_weights.safetensors) |
 
 ### World Expansion — WorldStereo Series
 
@@ -193,6 +194,8 @@ rm -rf flash-attention
 # For simpler installation, you can also use FlashAttention-2
 pip install flash-attn --no-build-isolation
 ```
+
+For **HY-Pano-2** installation, please refer to **[hyworld2/panogen/README.md](hyworld2/panogen/README.md)**.
 
 ### Code Usage — Panorama Generation (HY-Pano-2)
 
