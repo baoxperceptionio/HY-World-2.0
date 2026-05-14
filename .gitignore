@@ -1,4 +1,5 @@
 __pycache__/
+.claude/
 *.py[cod]
 *$py.class
 .gradio/
@@ -7,3 +8,5 @@ gradio_demo_output/
 skyseg.onnx
 *.safetensors
 *.ckpt
+CLAUDE.md
+commands.sh
