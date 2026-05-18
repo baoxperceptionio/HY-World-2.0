@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/b56f4750-25c9-48fb-83ff-d58526711463
 
 ## 🔥 News
 
-- **[May 14, 2026]**: 🤗 Open-source World Generation inference code and WorldStereo 2.0 model weights!
+- **[May 18, 2026]**: 🤗 Open-source World Generation inference code and WorldStereo 2.0 model weights!
 - **[May 11, 2026]**: 🤗 Open-source HY-Pano 2.0 inference code and model weights!
 - **[April 16, 2026]**: 🚀 Release HY-World 2.0 technical report & partial codes!
 - **[April 16, 2026]**: 🤗 Open-source WorldMirror 2.0 inference code and model weights!
