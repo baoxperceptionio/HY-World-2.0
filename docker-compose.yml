@@ -1,0 +1,51 @@
+services:
+  hyworld2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+        MAX_JOBS: ${MAX_JOBS:-8}
+    image: hyworld2:cuda12.8-gh200
+    container_name: hyworld2
+    working_dir: /workspace/HY-World-2.0
+    network_mode: host
+    gpus: all
+    ipc: host
+    shm_size: "64gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics}
+      TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+      MAX_JOBS: ${MAX_JOBS:-8}
+      FORCE_CUDA: "1"
+      CUDA_HOME: /usr/local/cuda
+      HF_HOME: /workspace/.cache/huggingface
+      HF_HUB_CACHE: /workspace/.cache/huggingface/hub
+      TORCH_HOME: /workspace/.cache/torch
+      MPLCONFIGDIR: /workspace/.cache/matplotlib
+      WANDB_DIR: /workspace/.cache/wandb
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      PYTHONPATH: /workspace/HY-World-2.0:/workspace/HY-World-2.0/hyworld2:/workspace/HY-World-2.0/hyworld2/worldgen:/workspace/HY-World-2.0/hyworld2/panogen
+      HYWORLD_CMD: ${HYWORLD_CMD:-}
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-8}
+    volumes:
+      - .:/workspace/HY-World-2.0
+      - ${HF_HOME_HOST:-/home/ubuntu/.cache/huggingface}:/workspace/.cache/huggingface
+      - hyworld2-cache:/workspace/.cache
+    command: >
+      bash -lc 'if [ -n "$$HYWORLD_CMD" ]; then
+      exec bash -lc "$$HYWORLD_CMD";
+      else
+      exec sleep infinity;
+      fi'
+    stdin_open: true
+    tty: true
+
+volumes:
+  hyworld2-cache:
