@@ -4,6 +4,7 @@ FROM sugar:cuda12.8-gh200
 ARG DEBIAN_FRONTEND=noninteractive
 ARG MAX_JOBS=8
 ARG TORCH_CUDA_ARCH_LIST=9.0
+ARG FLASH_ATTN_REF=v2.8.3
 ARG ONNXRUNTIME_REF=v1.23.2
 ARG DECORD_REF=v0.6.0
 
@@ -69,9 +70,11 @@ RUN python -m pip install --upgrade pip setuptools wheel packaging \
         "kornia" \
         "loguru==0.7.3" \
         "matplotlib==3.10.3" \
+        "ninja" \
         "opencv-python==4.10.0.84" \
         "openai" \
         "peft==0.18.1" \
+        "psutil" \
         "regex" \
         "safetensors==0.7.0" \
         "scikit-image==0.25.2" \
@@ -84,6 +87,12 @@ RUN python -m pip install --upgrade pip setuptools wheel packaging \
         "tyro==1.0.8" \
         "viser" \
     && python -m pip install "cupy-cuda12x==13.6.0"
+
+RUN git clone --recursive --depth 1 --branch ${FLASH_ATTN_REF} https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention \
+    && cd /tmp/flash-attention/hopper \
+    && FLASH_ATTENTION_DISABLE_SM80=TRUE python setup.py install \
+    && python -c 'import flash_attn_interface; print("FlashAttention 3 import OK", flash_attn_interface.flash_attn_func)' \
+    && rm -rf /tmp/flash-attention
 
 RUN git clone --recursive --branch ${DECORD_REF} https://github.com/dmlc/decord.git /tmp/decord \
     && cmake -S /tmp/decord -B /tmp/decord/build -GNinja \
@@ -125,7 +134,7 @@ RUN python - <<'PY'
 import importlib
 mods = [
     "diffusers", "transformers", "safetensors", "open3d", "pytorch3d",
-    "cupy", "decord", "moge", "onnxruntime", "utils3d", "zim_anything", "recast",
+    "cupy", "decord", "flash_attn_interface", "moge", "onnxruntime", "utils3d", "zim_anything", "recast",
 ]
 for mod in mods:
     importlib.import_module(mod)
