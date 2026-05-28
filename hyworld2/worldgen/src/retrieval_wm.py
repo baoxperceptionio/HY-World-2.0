@@ -36,6 +36,10 @@ from .general_utils import (
 from .pointcloud import depth2pcd
 
 
+def is_sam3_disabled():
+    return os.environ.get("HYWORLD_DISABLE_SAM3", "0").lower() in {"1", "true", "yes", "on"}
+
+
 def statistical_outlier_removal(points, colors, nb_neighbors=20, std_ratio=2.0):
     """
     KNN-based Statistical Outlier Removal.
@@ -820,10 +824,19 @@ class PanoramaMemoryBank:
         self.moge_model.eval()
 
         rank0_log(f"Initializing SAM3 Model...")
-        if sam3_model is None or sam3_processor is None:
-            from transformers import Sam3VideoModel, Sam3VideoProcessor
-            self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16)
-            self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+        if is_sam3_disabled():
+            rank0_log("SAM3 disabled by HYWORLD_DISABLE_SAM3; outdoor sky masks will be skipped.")
+            self.sam3_model = None
+            self.sam3_processor = None
+        elif sam3_model is None or sam3_processor is None:
+            try:
+                from transformers import Sam3VideoModel, Sam3VideoProcessor
+                self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16)
+                self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+            except Exception as e:
+                rank0_log(f"Warning: SAM3 is unavailable and outdoor sky masks will be skipped: {e}", "ERROR")
+                self.sam3_model = None
+                self.sam3_processor = None
         else:
             self.sam3_model = sam3_model
             self.sam3_processor = sam3_processor
@@ -1389,7 +1402,7 @@ class PanoramaMemoryBank:
                     mono_depths.append(moge_pred)
 
             # Use SAM3 to remove the sky mask.
-            if self.meta_info["scene_type"] == "outdoor":
+            if self.meta_info["scene_type"] == "outdoor" and self.sam3_model is not None and self.sam3_processor is not None:
                 video_frames = []
                 for frame in gen_frames:
                     video_frames.append(np.array(frame))

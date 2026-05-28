@@ -38,15 +38,8 @@ def sort_trajs(scene_path):
             if v["valid"] != "yes":  # skip invalid views
                 continue
         traj_paths_ = glob(f"{view_path}/traj*/render.mp4")
-        traj_paths_.sort()
-        traj_paths = []
-        if f"{view_path}/traj2/render.mp4" in traj_paths_:
-            traj_paths.append(f"{view_path}/traj2/render.mp4")
-        if f"{view_path}/traj0/render.mp4" in traj_paths_:
-            traj_paths.append(f"{view_path}/traj0/render.mp4")
-        if f"{view_path}/traj1/render.mp4" in traj_paths_:
-            traj_paths.append(f"{view_path}/traj1/render.mp4")
-        view_list.extend(traj_paths)
+        traj_paths_.sort(key=lambda path: int(path.split("/")[-2].replace("traj", "")))
+        view_list.extend(traj_paths_)
     target_list = glob(f"{scene_path}/target*/traj*/render.mp4")
     target_list.sort(key=lambda x: (x.split('/')[-3], x.split('/')[-2]))
     recon_list = glob(f"{scene_path}/reconstruct*/traj0/render.mp4")

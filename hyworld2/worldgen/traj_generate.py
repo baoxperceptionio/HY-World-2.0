@@ -9,7 +9,6 @@ from glob import glob
 
 import cv2
 import numpy as np
-import open3d as o3d
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
@@ -17,10 +16,8 @@ import trimesh
 import utils3d
 from PIL import Image
 from moge.model.v2 import MoGeModel
-from openai import OpenAI
 from scipy.spatial import cKDTree
 from tqdm import tqdm
-from transformers import Sam3Processor, Sam3Model
 
 from src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
 from src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
@@ -56,7 +53,7 @@ from src.panorama_utils import (
 )
 from src.pointcloud import point_rendering
 from src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
-from src.vlm_utils import get_qwen_caption_format
+from src.vlm_utils import create_openai_client, get_qwen_caption_format, resolve_llm_model_name
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 timer = Timer()
@@ -79,6 +76,67 @@ ZIM_SUBFOLDER = "zim_vit_l_2092"
 GD_REPO_ID = "IDEA-Research/grounding-dino-tiny"
 SAM3_REPO_ID = "facebook/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
+
+DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"]
+SUPPORTED_TRAJECTORY_MODES = {
+    "right-rotation",
+    "left-rotation",
+    "up-right-aerial",
+    "up-rotation",
+    "forward",
+    "backward",
+    "right-translation",
+    "left-translation",
+}
+
+
+def is_sam3_disabled():
+    return os.environ.get("HYWORLD_DISABLE_SAM3", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def require_cuda_device():
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return torch.device("cuda")
+
+    raise RuntimeError(
+        "HY-World trajectory generation requires a CUDA GPU, but PyTorch cannot see one. "
+        "Run this stage through the Docker Compose service with GPU access, then verify "
+        "inside the container with `docker compose exec hyworld2 nvidia-smi` and "
+        "`docker compose exec hyworld2 python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.device_count())\"`."
+    )
+
+
+def parse_trajectory_modes(value):
+    modes = [mode.strip() for mode in value.split(",") if mode.strip()]
+    if not modes:
+        raise ValueError("At least one trajectory mode is required.")
+    unknown = [mode for mode in modes if mode not in SUPPORTED_TRAJECTORY_MODES]
+    if unknown:
+        raise ValueError(f"Unknown trajectory mode(s): {', '.join(unknown)}")
+    return modes
+
+
+def build_camera_candidates(args):
+    modes = parse_trajectory_modes(args.trajectory_modes)
+    candidates = []
+    for mode in modes:
+        if mode == "right-rotation":
+            candidates.append({"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [-args.rotation_deg, 0], "name": mode})
+        elif mode == "left-rotation":
+            candidates.append({"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [args.rotation_deg, 0], "name": mode})
+        elif mode == "up-right-aerial":
+            candidates.append({"type": "aerial", "backward-forward": 0, "left-right": 0, "rotation": [-args.up_right, -args.rotation_up], "name": mode})
+        elif mode == "up-rotation":
+            candidates.append({"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [0, -args.rotation_up], "name": mode})
+        elif mode == "forward":
+            candidates.append({"type": "normal", "backward-forward": 1.0, "left-right": 0, "rotation": [0, 0], "name": mode})
+        elif mode == "backward":
+            candidates.append({"type": "normal", "backward-forward": -1.0, "left-right": 0, "rotation": [0, 0], "name": mode})
+        elif mode == "right-translation":
+            candidates.append({"type": "normal", "backward-forward": 0, "left-right": 1.0, "rotation": [0, 0], "name": mode})
+        elif mode == "left-translation":
+            candidates.append({"type": "normal", "backward-forward": 0, "left-right": -1.0, "rotation": [0, 0], "name": mode})
+    return candidates
 
 
 def resolve_hf_checkpoint(repo_id, allow_patterns=None, subfolder=None, required_files=None):
@@ -143,6 +201,8 @@ if __name__ == '__main__':
     parser.add_argument("--fov_y", default=90, type=float, help="panorama split fov y")
     parser.add_argument("--seed", default=1024, type=int, help="random seed for reproducibility")
     parser.add_argument("--split_view_num", default=3, type=int, help="final split view num")
+    parser.add_argument("--trajectory_modes", default=",".join(DEFAULT_TRAJECTORY_MODES),
+                        help=f"Comma-separated regular trajectory modes. Supported: {', '.join(sorted(SUPPORTED_TRAJECTORY_MODES))}")
     parser.add_argument("--splitted_resolution", default=480, type=int, help="splitted resolution")
     parser.add_argument("--nframe", default=21, type=int, help="number of frames for trajectory generation")
     parser.add_argument("--distance_threshold", default=0.1, type=float, help="distance threshold for obstacle avoidance")
@@ -191,9 +251,11 @@ if __name__ == '__main__':
     # Override globals with argparse values
     LLM_ADDR = args.llm_addr
     LLM_PORT = args.llm_port
-    MODEL_NAME = args.llm_name
+    MODEL_NAME = resolve_llm_model_name(args.llm_name)
 
-    device = torch.device("cuda")
+    device = require_cuda_device()
+    import open3d as o3d
+
     set_seed(args.seed)
 
     print("Models Initializing...")
@@ -202,21 +264,27 @@ if __name__ == '__main__':
 
     depth_model = MoGeModel.from_pretrained(MOGE_ID).to(device).eval()
 
-    # VLM & SAM3
-    client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
-    sam3_model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-    sam3_processor = Sam3Processor.from_pretrained("facebook/sam3")
+    # VLM. SAM3 is only needed for optional navigation trajectories below.
+    client = create_openai_client(LLM_ADDR, LLM_PORT)
+    sam3_model, sam3_processor = None, None
+    if is_sam3_disabled():
+        rank0_log("SAM3 disabled by HYWORLD_DISABLE_SAM3; navigation object masks will be skipped.")
+    elif args.apply_nav_traj:
+        try:
+            from transformers import Sam3Model, Sam3Processor
+
+            sam3_model = Sam3Model.from_pretrained(SAM3_REPO_ID).to(device)
+            sam3_processor = Sam3Processor.from_pretrained(SAM3_REPO_ID)
+        except Exception as e:
+            rank0_log(f"Warning: SAM3 is unavailable and navigation object masks will be skipped: {e}", "ERROR")
     print("Models Initializing over.")
 
-    # Near-view rotations used by regular trajectory generation.
-    camera_candidates_near = [
-        {"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [-args.rotation_deg, 0], "name": "right-rotation"},
-        {"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [args.rotation_deg, 0], "name": "left-rotation"},
-    ]
-    if args.up_right > 0:
-        camera_candidates_near.append({"type": "aerial", "backward-forward": 0, "left-right": 0, "rotation": [-args.up_right, -args.rotation_up], "name": "up-right-aerial"})
-    else:
-        camera_candidates_near.append({"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [0, -args.rotation_up], "name": "up-rotation"})
+    # Near-view trajectories used by regular trajectory generation.
+    try:
+        camera_candidates_near = build_camera_candidates(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print("Regular trajectory modes:", ", ".join(move["name"] for move in camera_candidates_near))
 
     if os.path.exists(f"{args.target_path}/panorama.png"):
         scene_list = [args.target_path]  # single path VLM inference
@@ -273,7 +341,11 @@ if __name__ == '__main__':
 
         os.makedirs(f"{scene_path}/render_results", exist_ok=True)
 
-        if os.path.exists(f"{scene_path}/render_results/sky_mask.png"):
+        if meta_info.get("scene_type") == "indoor":
+            with timer.track("Get sky mask"):
+                sky_mask = torch.zeros((full_img.size[1], full_img.size[0])).bool()
+            transforms.ToPILImage()(((~sky_mask).float() * 255).to(torch.uint8)).save(f"{scene_path}/render_results/sky_mask.png")
+        elif os.path.exists(f"{scene_path}/render_results/sky_mask.png"):
             sky_mask = np.array(Image.open(f"{scene_path}/render_results/sky_mask.png")) / 255
             sky_mask = ~torch.from_numpy(sky_mask).bool()
         elif os.path.exists(f"{scene_path}/sky_mask.png"):
@@ -692,7 +764,7 @@ if __name__ == '__main__':
                 unique_objects = json.load(open(os.path.join(scene_path, "objects.json"), "r"))
 
             # processing object segmentation and masking
-            if unique_objects:
+            if unique_objects and sam3_model is not None and sam3_processor is not None:
                 img_w, img_h = full_img.size
                 occupancy_map = np.zeros((img_h, img_w), dtype=bool)
                 valid_masks_vis = []
@@ -849,6 +921,10 @@ if __name__ == '__main__':
                 with timer.track("[IO] Save combined_with_markers.ply"):
                     if segmentation_data:
                         create_and_save_combined_pcd(global_pcd, segmentation_data, os.path.join(scene_path, "render_results", "combined_with_markers.ply"))
+            elif unique_objects:
+                rank0_log("Warning: SAM3 is unavailable; writing empty target_camera.json.", "ERROR")
+                with open(os.path.join(camera_dir, "target_camera.json"), "w") as f:
+                    json.dump(segmentation_data, f, indent=4)
 
             # NavMesh & Paths
             try:

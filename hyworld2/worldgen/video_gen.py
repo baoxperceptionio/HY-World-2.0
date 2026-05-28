@@ -12,7 +12,6 @@ from diffusers.utils import export_to_video
 from moge.model.v2 import MoGeModel
 from torch.distributed.device_mesh import init_device_mesh
 from tqdm import tqdm
-from transformers import Sam3VideoModel, Sam3VideoProcessor
 
 from models.worldstereo_wrapper import WorldStereo
 from src.data_utils import sort_trajs, load_mutli_traj_dataset
@@ -25,6 +24,11 @@ timer = Timer()
 
 SAM3_REPO_ID = "facebook/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
+
+
+def is_sam3_disabled():
+    return os.environ.get("HYWORLD_DISABLE_SAM3", "0").lower() in {"1", "true", "yes", "on"}
+
 
 if __name__ == '__main__':
     # == parse configs ==
@@ -77,8 +81,17 @@ if __name__ == '__main__':
     # == setup models ==
     # Note: FP8 quantization is done INSIDE init_wan_from_cfg, BEFORE FSDP sharding
     moge_model = MoGeModel.from_pretrained(MOGE_ID).to(device)
-    sam3_model = Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(device, dtype=torch.bfloat16)
-    sam3_processor = Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID)
+    sam3_model, sam3_processor = None, None
+    if is_sam3_disabled():
+        rank0_log("SAM3 disabled by HYWORLD_DISABLE_SAM3; outdoor sky masks will be skipped.")
+    else:
+        try:
+            from transformers import Sam3VideoModel, Sam3VideoProcessor
+
+            sam3_model = Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(device, dtype=torch.bfloat16)
+            sam3_processor = Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID)
+        except Exception as e:
+            rank0_log(f"Warning: SAM3 is unavailable and outdoor sky masks will be skipped: {e}", "ERROR")
     rank0_log("Model init over...")
 
     # reset it to the fp32 as we make diffusion scheduler in fp32

@@ -7,6 +7,22 @@ import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const DEFAULT_SPLIT_VIEW_NUM = 4;
+const DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"];
+const DEFAULT_GS_MAX_STEPS = 8000;
+const MAX_LOG_CHARS = 1_000_000;
+const SETTINGS_STORAGE_KEY = "hyworld2.pipelineSettings";
+const STARTABLE_JOB_STATES = new Set<JobState>(["ready", "failed", "canceled"]);
+const TRAJECTORY_MODE_OPTIONS = [
+  ["right-rotation", "Right rotation"],
+  ["left-rotation", "Left rotation"],
+  ["up-right-aerial", "Up-right aerial"],
+  ["up-rotation", "Up rotation"],
+  ["forward", "Forward translation"],
+  ["backward", "Backward translation"],
+  ["right-translation", "Right translation"],
+  ["left-translation", "Left translation"],
+] as const;
+const MAX_TRAJECTORIES_PER_VIEW = 8;
 
 type JobState = "ready" | "queued" | "running" | "succeeded" | "failed" | "canceled";
 
@@ -16,18 +32,24 @@ type Job = {
   stage: string;
   progress: string;
   prompt: string;
+  prompt_source?: string;
+  prompt_error?: string | null;
   run_dir: string;
   created_at: string;
   updated_at: string;
   error: string | null;
   split_view_num: number;
+  trajectory_modes: string[];
+  indoor: boolean;
+  gs_max_steps: number;
   artifacts: Record<string, string>;
 };
 
 type SseEvent = {
-  type: "status" | "log";
+  type: "status" | "log" | "log_chunk";
   job?: Job;
   line?: string;
+  chunk?: string;
 };
 
 type ViewerMeta = {
@@ -50,6 +72,13 @@ type PreviewItem = {
   updated_at: string | null;
 };
 
+type PipelineSettings = {
+  splitViewNum: number;
+  trajectoryModes: string[];
+  indoor: boolean;
+  gsMaxSteps: number;
+};
+
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
@@ -58,6 +87,58 @@ function absoluteArtifactUrl(path: string) {
   if (path.startsWith("http")) return path;
   if (API_BASE.startsWith("http")) return `${API_BASE}${path}`;
   return `${window.location.origin}${API_BASE}${path}`;
+}
+
+function clampInteger(value: number, fallback: number, min: number, max: number) {
+  const rounded = Math.round(Number.isFinite(value) ? value : fallback);
+  return Math.max(min, Math.min(max, rounded || fallback));
+}
+
+function defaultPipelineSettings(): PipelineSettings {
+  return {
+    splitViewNum: DEFAULT_SPLIT_VIEW_NUM,
+    trajectoryModes: DEFAULT_TRAJECTORY_MODES,
+    indoor: false,
+    gsMaxSteps: DEFAULT_GS_MAX_STEPS,
+  };
+}
+
+function normalizeTrajectoryModes(modes: string[] | undefined, count?: number) {
+  const supported = new Set(TRAJECTORY_MODE_OPTIONS.map(([value]) => value));
+  const cleaned = (modes?.filter((mode) => supported.has(mode as (typeof TRAJECTORY_MODE_OPTIONS)[number][0])) ?? []);
+  const baseCount = count ?? (cleaned.length || DEFAULT_TRAJECTORY_MODES.length);
+  const targetCount = clampInteger(baseCount, DEFAULT_TRAJECTORY_MODES.length, 1, MAX_TRAJECTORIES_PER_VIEW);
+  const next = cleaned.slice(0, targetCount);
+  for (let index = next.length; index < targetCount; index += 1) {
+    next.push(TRAJECTORY_MODE_OPTIONS[index % TRAJECTORY_MODE_OPTIONS.length][0]);
+  }
+  return next;
+}
+
+function normalizePipelineSettings(value: Partial<PipelineSettings> = {}): PipelineSettings {
+  const defaults = defaultPipelineSettings();
+  return {
+    splitViewNum: clampInteger(value.splitViewNum ?? defaults.splitViewNum, defaults.splitViewNum, 1, 8),
+    trajectoryModes: normalizeTrajectoryModes(value.trajectoryModes ?? defaults.trajectoryModes),
+    indoor: value.indoor ?? defaults.indoor,
+    gsMaxSteps: clampInteger(value.gsMaxSteps ?? defaults.gsMaxSteps, defaults.gsMaxSteps, 100, 50000),
+  };
+}
+
+function loadPipelineSettings() {
+  if (typeof window === "undefined") return defaultPipelineSettings();
+  try {
+    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    return raw ? normalizePipelineSettings(JSON.parse(raw) as Partial<PipelineSettings>) : defaultPipelineSettings();
+  } catch {
+    return defaultPipelineSettings();
+  }
+}
+
+function appendLogText(existing: string, text: string) {
+  if (!text) return existing;
+  const next = `${existing}${text}`;
+  return next.length > MAX_LOG_CHARS ? next.slice(next.length - MAX_LOG_CHARS) : next;
 }
 
 function useJobs() {
@@ -346,8 +427,46 @@ function StateIcon({ state }: { state: JobState }) {
   return <Activity size={16} />;
 }
 
+function previewViewIndex(item: PreviewItem) {
+  const match = item.id.match(/^(?:split-view|view)-(\d+)(?:-|$)/);
+  return match ? Number(match[1]) : null;
+}
+
+function PreviewCard({ item }: { item: PreviewItem }) {
+  return (
+    <article className={`preview-card ${item.available ? "available" : "pending"}`}>
+      <div className="preview-media">
+        {item.available && item.url && item.kind === "video" && (
+          <video src={apiUrl(item.url)} controls muted loop playsInline preload="metadata" />
+        )}
+        {item.available && item.url && item.kind === "image" && <img src={apiUrl(item.url)} alt={item.title} loading="lazy" />}
+        {!item.available && <FileArchive size={26} />}
+      </div>
+      <div className="preview-meta">
+        <div>
+          <strong>{item.title}</strong>
+          <span>{item.stage}</span>
+        </div>
+        <p>{item.description}</p>
+        <small>{item.available ? item.path : "pending"}</small>
+      </div>
+    </article>
+  );
+}
+
 function PreviewPanel({ items }: { items: PreviewItem[] }) {
   const availableItems = items.filter((item) => item.available && item.url);
+  const overviewItems = items.filter((item) => previewViewIndex(item) === null);
+  const viewGroups = Array.from(
+    items.reduce((groups, item) => {
+      const viewIndex = previewViewIndex(item);
+      if (viewIndex === null) return groups;
+      const groupItems = groups.get(viewIndex) ?? [];
+      groupItems.push(item);
+      groups.set(viewIndex, groupItems);
+      return groups;
+    }, new Map<number, PreviewItem[]>())
+  ).sort(([a], [b]) => a - b);
 
   return (
     <section className="preview-panel" aria-label="Pipeline previews">
@@ -355,26 +474,29 @@ function PreviewPanel({ items }: { items: PreviewItem[] }) {
         <h2>Pipeline Preview</h2>
         <span>{availableItems.length}/{items.length || 0}</span>
       </div>
-      <div className="preview-grid">
+      <div className="preview-rows">
         {items.length === 0 && <div className="preview-empty">Previews will appear as stages finish.</div>}
-        {items.map((item) => (
-          <article key={item.id} className={`preview-card ${item.available ? "available" : "pending"}`}>
-            <div className="preview-media">
-              {item.available && item.url && item.kind === "video" && (
-                <video src={apiUrl(item.url)} controls muted loop playsInline preload="metadata" />
-              )}
-              {item.available && item.url && item.kind === "image" && <img src={apiUrl(item.url)} alt={item.title} loading="lazy" />}
-              {!item.available && <FileArchive size={26} />}
+        {overviewItems.length > 0 && (
+          <div className="preview-row">
+            <div className="preview-row-heading">
+              <h3>Overview</h3>
+              <span>{overviewItems.filter((item) => item.available).length}/{overviewItems.length}</span>
             </div>
-            <div className="preview-meta">
-              <div>
-                <strong>{item.title}</strong>
-                <span>{item.stage}</span>
-              </div>
-              <p>{item.description}</p>
-              <small>{item.available ? item.path : "pending"}</small>
+            <div className="preview-strip">
+              {overviewItems.map((item) => <PreviewCard key={item.id} item={item} />)}
             </div>
-          </article>
+          </div>
+        )}
+        {viewGroups.map(([viewIndex, groupItems]) => (
+          <div className="preview-row" key={viewIndex}>
+            <div className="preview-row-heading">
+              <h3>View {viewIndex}</h3>
+              <span>{groupItems.filter((item) => item.available).length}/{groupItems.length}</span>
+            </div>
+            <div className="preview-strip">
+              {groupItems.map((item) => <PreviewCard key={item.id} item={item} />)}
+            </div>
+          </div>
         ))}
       </div>
     </section>
@@ -383,19 +505,39 @@ function PreviewPanel({ items }: { items: PreviewItem[] }) {
 
 function App() {
   const centerColumnRef = useRef<HTMLDivElement | null>(null);
+  const logsRef = useRef<HTMLPreElement | null>(null);
+  const liveLogChunkSeenRef = useRef(false);
   const { jobs, setJobs, refresh } = useJobs();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [prompt, setPrompt] = useState("uploaded panorama");
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<PreviewItem[]>([]);
-  const [splitViewNum, setSplitViewNum] = useState(DEFAULT_SPLIT_VIEW_NUM);
+  const [pipelineSettings, setPipelineSettings] = useState<PipelineSettings>(() => loadPipelineSettings());
   const [previewHeight, setPreviewHeight] = useState(330);
+  const { splitViewNum, trajectoryModes, indoor, gsMaxSteps } = pipelineSettings;
 
   const currentJob = activeJob ?? jobs.find((job) => job.id === selectedId) ?? jobs[0] ?? null;
+  const llmDescription = currentJob?.prompt?.trim() ?? "";
+  const promptSource = currentJob?.prompt_source ?? "unknown";
+  const promptError = currentJob?.prompt_error?.trim() ?? "";
+  const hasLlmDescription = promptSource === "llm" && Boolean(llmDescription);
+  const promptPending = currentJob?.stage === "prompt synthesis" && !hasLlmDescription && !promptError;
+  const llmDescriptionTitle = hasLlmDescription ? "Auto-generated LLM description" : "LLM description status";
+  const llmDescriptionText = uploading
+    ? "Uploading image..."
+    : hasLlmDescription
+      ? llmDescription
+      : promptPending
+        ? "Generating the scene description from the uploaded image..."
+        : currentJob && promptSource === "not_started"
+          ? "Click Start to generate the scene description."
+          : currentJob && promptSource !== "unknown"
+          ? `${promptError || "LLM did not produce a scene-specific description."} The pipeline is using a generic fallback prompt.`
+          : "Upload an image, then click Start to generate the scene description.";
+  const promptLabel = promptSource === "llm" ? "LLM prompt" : promptSource === "unknown" ? "Auto prompt" : "Fallback prompt";
   const splatUrl = currentJob?.state === "succeeded" && currentJob.artifacts["point_cloud_7999.spz"]
     ? absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"])
     : null;
@@ -415,8 +557,33 @@ function App() {
   }, [jobs, selectedId]);
 
   useEffect(() => {
-    if (currentJob) setSplitViewNum(currentJob.split_view_num ?? DEFAULT_SPLIT_VIEW_NUM);
-  }, [currentJob?.id]);
+    if (logsRef.current) {
+      logsRef.current.scrollTop = logsRef.current.scrollHeight;
+    }
+  }, [logs]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(normalizePipelineSettings(pipelineSettings)));
+  }, [pipelineSettings]);
+
+  function updatePipelineSettings(update: Partial<PipelineSettings>) {
+    setPipelineSettings((existing) => normalizePipelineSettings({ ...existing, ...update }));
+  }
+
+  function setTrajectoryCount(count: number) {
+    setPipelineSettings((existing) => ({
+      ...existing,
+      trajectoryModes: normalizeTrajectoryModes(existing.trajectoryModes, count),
+    }));
+  }
+
+  function setTrajectoryMode(index: number, mode: string) {
+    setPipelineSettings((existing) => {
+      const next = normalizeTrajectoryModes(existing.trajectoryModes);
+      next[index] = mode;
+      return { ...existing, trajectoryModes: next };
+    });
+  }
 
   async function refreshPreviews(jobId: string) {
     const response = await fetch(apiUrl(`/api/jobs/${jobId}/previews`));
@@ -427,7 +594,8 @@ function App() {
     if (!currentJob) return;
     setSelectedId(currentJob.id);
     setActiveJob(currentJob);
-    setLogs([]);
+    setLogs("");
+    liveLogChunkSeenRef.current = false;
     setPreviews([]);
     refreshPreviews(currentJob.id);
 
@@ -437,27 +605,44 @@ function App() {
         refreshPreviews(job.id);
       }
     };
+    const handleStatus = (job: Job) => {
+      setActiveJob(job);
+      maybeRefreshPreviews(job);
+    };
+    const handleLogLine = (line: string) => {
+      if (liveLogChunkSeenRef.current) return;
+      setLogs((existing) => appendLogText(existing, `${line}\n`));
+    };
+    const handleLogChunk = (chunk: string) => {
+      liveLogChunkSeenRef.current = true;
+      setLogs((existing) => appendLogText(existing, chunk));
+    };
     source.onmessage = (event) => {
       const payload = JSON.parse(event.data) as SseEvent;
       if (payload.type === "status" && payload.job) {
-        setActiveJob(payload.job);
-        maybeRefreshPreviews(payload.job);
+        handleStatus(payload.job);
       }
       if (payload.type === "log" && payload.line !== undefined) {
-        setLogs((existing) => [...existing.slice(-800), payload.line as string]);
+        handleLogLine(payload.line);
+      }
+      if (payload.type === "log_chunk" && payload.chunk !== undefined) {
+        handleLogChunk(payload.chunk);
       }
     };
     source.addEventListener("status", (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
       if (payload.job) {
-        setActiveJob(payload.job);
+        handleStatus(payload.job);
         setJobs((existing) => [payload.job as Job, ...existing.filter((job) => job.id !== payload.job?.id)]);
-        maybeRefreshPreviews(payload.job);
       }
     });
     source.addEventListener("log", (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
-      if (payload.line !== undefined) setLogs((existing) => [...existing.slice(-800), payload.line as string]);
+      if (payload.line !== undefined) handleLogLine(payload.line);
+    });
+    source.addEventListener("log_chunk", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
+      if (payload.chunk !== undefined) handleLogChunk(payload.chunk);
     });
     const previewTimer = window.setInterval(() => {
       if (["queued", "running"].includes(currentJob.state)) refreshPreviews(currentJob.id);
@@ -475,8 +660,10 @@ function App() {
     setError(null);
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("prompt", prompt);
-    formData.append("split_view_num", String(Math.max(1, Math.min(8, Math.round(splitViewNum || DEFAULT_SPLIT_VIEW_NUM)))));
+    formData.append("split_view_num", String(clampInteger(splitViewNum, DEFAULT_SPLIT_VIEW_NUM, 1, 8)));
+    formData.append("trajectory_modes", normalizeTrajectoryModes(trajectoryModes).join(","));
+    formData.append("indoor", String(indoor));
+    formData.append("gs_max_steps", String(clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000)));
     const response = await fetch(apiUrl("/api/jobs"), { method: "POST", body: formData });
     setUploading(false);
     if (!response.ok) {
@@ -488,18 +675,30 @@ function App() {
     setJobs((existing) => [job, ...existing]);
     setSelectedId(job.id);
     setActiveJob(job);
-    setLogs([]);
+    setLogs("");
+    liveLogChunkSeenRef.current = false;
     setPreviews([]);
-    setSplitViewNum(job.split_view_num ?? DEFAULT_SPLIT_VIEW_NUM);
     refreshPreviews(job.id);
   }
 
   async function startJob() {
     if (!currentJob) return;
     setError(null);
-    const safeSplitViewNum = Math.max(1, Math.min(8, Math.round(splitViewNum || DEFAULT_SPLIT_VIEW_NUM)));
-    setSplitViewNum(safeSplitViewNum);
-    const response = await fetch(apiUrl(`/api/jobs/${currentJob.id}/start?split_view_num=${safeSplitViewNum}`), { method: "POST" });
+    const safeSplitViewNum = clampInteger(splitViewNum, DEFAULT_SPLIT_VIEW_NUM, 1, 8);
+    const safeTrajectoryModes = normalizeTrajectoryModes(trajectoryModes);
+    const safeGsMaxSteps = clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000);
+    updatePipelineSettings({
+      splitViewNum: safeSplitViewNum,
+      trajectoryModes: safeTrajectoryModes,
+      gsMaxSteps: safeGsMaxSteps,
+    });
+    const params = new URLSearchParams({
+      split_view_num: String(safeSplitViewNum),
+      trajectory_modes: safeTrajectoryModes.join(","),
+      indoor: String(indoor),
+      gs_max_steps: String(safeGsMaxSteps),
+    });
+    const response = await fetch(apiUrl(`/api/jobs/${currentJob.id}/start?${params.toString()}`), { method: "POST" });
     if (!response.ok) {
       const body = await response.json().catch(() => ({ detail: response.statusText }));
       setError(body.detail ?? "Start failed.");
@@ -554,10 +753,14 @@ function App() {
             <ImageUp size={28} />
             <span>{file ? file.name : "Select panorama"}</span>
           </label>
-          <label className="field">
-            <span>Prompt</span>
-            <input value={prompt} onChange={(event) => setPrompt(event.target.value)} />
-          </label>
+          <button className="primary-button" type="submit" disabled={!file || uploading}>
+            {uploading ? <Loader2 className="spin" size={17} /> : <UploadCloud size={17} />}
+            <span>Upload</span>
+          </button>
+          <div className="llm-description-box" aria-live="polite">
+            <span>{llmDescriptionTitle}</span>
+            <p>{llmDescriptionText}</p>
+          </div>
           <label className="field compact-field">
             <span>Scene splits</span>
             <input
@@ -566,13 +769,47 @@ function App() {
               max={8}
               step={1}
               value={splitViewNum}
-              onChange={(event) => setSplitViewNum(Number(event.target.value))}
+              onChange={(event) => updatePipelineSettings({ splitViewNum: Number(event.target.value) })}
             />
           </label>
-          <button className="primary-button" type="submit" disabled={!file || uploading}>
-            {uploading ? <Loader2 className="spin" size={17} /> : <UploadCloud size={17} />}
-            <span>Upload</span>
-          </button>
+          <div className="field trajectory-field">
+            <span>Trajectories per view</span>
+            <input
+              type="number"
+              min={1}
+              max={MAX_TRAJECTORIES_PER_VIEW}
+              step={1}
+              value={trajectoryModes.length}
+              onChange={(event) => setTrajectoryCount(Number(event.target.value))}
+            />
+            <div className="trajectory-mode-grid">
+              {trajectoryModes.map((mode, index) => (
+                <label key={index}>
+                  <span>traj{index}</span>
+                  <select value={mode} onChange={(event) => setTrajectoryMode(index, event.target.value)}>
+                    {TRAJECTORY_MODE_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
+          <label className="checkbox-field">
+            <input type="checkbox" checked={indoor} onChange={(event) => updatePipelineSettings({ indoor: event.target.checked })} />
+            <span>Indoor</span>
+          </label>
+          <label className="field compact-field">
+            <span>GS steps</span>
+            <input
+              type="number"
+              min={100}
+              max={50000}
+              step={100}
+              value={gsMaxSteps}
+              onChange={(event) => updatePipelineSettings({ gsMaxSteps: Number(event.target.value) })}
+            />
+          </label>
           {error && <div className="error-line">{error}</div>}
         </form>
 
@@ -605,26 +842,19 @@ function App() {
             </span>
             <h2>{currentJob?.stage ?? "Ready"}</h2>
             <p>{currentJob?.progress ?? "Upload a panorama to start."}</p>
+            {currentJob?.prompt && (
+              <p className={`prompt-line ${promptSource === "llm" ? "" : "fallback"}`}>
+                <span>{promptLabel}</span>
+                {currentJob.prompt}
+              </p>
+            )}
           </div>
           <div className="actions">
-            {currentJob?.state === "ready" && (
-              <>
-                <label className="inline-field">
-                  <span>Scene splits</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={8}
-                    step={1}
-                    value={splitViewNum}
-                    onChange={(event) => setSplitViewNum(Number(event.target.value))}
-                  />
-                </label>
-                <button className="primary-button compact-button" onClick={startJob}>
-                  <Play size={16} />
-                  <span>Start</span>
-                </button>
-              </>
+            {currentJob && STARTABLE_JOB_STATES.has(currentJob.state) && (
+              <button className="primary-button compact-button" onClick={startJob}>
+                <Play size={16} />
+                <span>Start</span>
+              </button>
             )}
             {currentJob && ["ready", "queued", "running"].includes(currentJob.state) && (
               <button className="secondary-button" onClick={cancelJob}>
@@ -656,9 +886,9 @@ function App() {
           <section className="logs-panel" aria-label="Pipeline logs">
             <div className="panel-heading">
               <h2>Logs</h2>
-              <span>{logs.length}</span>
+              <span>latest</span>
             </div>
-            <pre>{logs.length ? logs.join("\n") : "Logs will stream here."}</pre>
+            <pre ref={logsRef}>{logs || "Logs will stream here."}</pre>
           </section>
         </div>
       </section>

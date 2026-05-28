@@ -388,8 +388,9 @@ class WorldStereo:
                 encoder_states = encoder_states + (hidden_states,)
                 return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)
 
-            image_clip.vision_model.forward = types.MethodType(_clip_vision_forward, image_clip.vision_model)
-            image_clip.vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, image_clip.vision_model.encoder)
+            clip_vision_model = image_clip.vision_model if hasattr(image_clip, "vision_model") else image_clip
+            clip_vision_model.forward = types.MethodType(_clip_vision_forward, clip_vision_model)
+            clip_vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, clip_vision_model.encoder)
 
         # ---- VAE ----
         vae_dtype = _get_half_dtype()
@@ -412,7 +413,8 @@ class WorldStereo:
             fully_shard(text_encoder, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for T5.")
 
-            for layer in image_clip.vision_model.encoder.layers:
+            clip_vision_model = image_clip.vision_model if hasattr(image_clip, "vision_model") else image_clip
+            for layer in clip_vision_model.encoder.layers:
                 fully_shard(layer, **fsdp_kwargs)
             fully_shard(image_clip, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for CLIP.")

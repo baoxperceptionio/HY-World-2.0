@@ -97,7 +97,10 @@ def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:
 def get_panorama_cameras_v2(subdivisions=0):
     vertices = subdivide_icosahedron(subdivisions=subdivisions)
     intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
-    extrinsics = utils3d.numpy.extrinsics_look_at([0, 0, 0], vertices, [0, 0, 1]).astype(np.float32)
+    up_vectors = np.tile(np.array([0, 0, 1], dtype=np.float32), (len(vertices), 1))
+    pole_views = np.abs(vertices[:, 2] / np.linalg.norm(vertices, axis=-1)) > 0.999
+    up_vectors[pole_views] = np.array([0, 1, 0], dtype=np.float32)
+    extrinsics = utils3d.numpy.extrinsics_look_at([0, 0, 0], vertices, up_vectors).astype(np.float32)
     return extrinsics, [intrinsics] * len(vertices)
 
 

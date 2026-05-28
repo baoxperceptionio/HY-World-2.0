@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -16,15 +18,50 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from openai import OpenAI
 from PIL import Image, UnidentifiedImageError
 
 
+logger = logging.getLogger(__name__)
 ROOT_DIR = Path(os.environ.get("HYWORLD_ROOT", Path(__file__).resolve().parents[2]))
 WORLDGEN_DIR = ROOT_DIR / "hyworld2" / "worldgen"
 OUTPUT_ROOT = ROOT_DIR / "outputs" / "web_runs"
 JOBS_LOG = OUTPUT_ROOT / "jobs.jsonl"
 TARGET_SIZE = (1920, 960)
 DEFAULT_SPLIT_VIEW_NUM = 4
+DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"]
+MAX_TRAJECTORY_MODES = 8
+DEFAULT_GS_MAX_STEPS = 8000
+MIN_GS_MAX_STEPS = 100
+MAX_GS_MAX_STEPS = 50000
+AUTO_PROMPT_FALLBACK = (
+    "A cinematic camera trajectory through the panoramic scene, preserving the visible "
+    "architecture, terrain, lighting, materials, objects, and overall visual style."
+)
+AUTO_PROMPT_IMAGE_SIZE = (768, 384)
+GENERIC_PROMPT_MARKERS = (
+    "panoramic scene",
+    "visible architecture, terrain, lighting, materials, objects",
+    "architecture, terrain, lighting, materials, objects",
+    "overall visual style",
+    "major objects",
+)
+LEGACY_PROMPT_PLACEHOLDERS = {
+    "uploaded panorama",
+    "an ancient chinese palace",
+    "a chinese palace",
+}
+
+TRAJECTORY_MODE_LABELS = {
+    "right-rotation": ("right rotation", "Camera rotates right from this split view."),
+    "left-rotation": ("left rotation", "Camera rotates left from this split view."),
+    "up-right-aerial": ("up-right aerial", "Camera pitches upward and rotates toward the right."),
+    "up-rotation": ("up rotation", "Camera pitches upward from this split view."),
+    "forward": ("forward translation", "Camera translates forward from this split view."),
+    "backward": ("backward translation", "Camera translates backward from this split view."),
+    "right-translation": ("right translation", "Camera translates to the right from this split view."),
+    "left-translation": ("left translation", "Camera translates to the left from this split view."),
+}
 
 ARTIFACTS = {
     "panorama.png": ("panorama.png", "image/png"),
@@ -55,13 +92,6 @@ PREVIEW_SPECS = [
     ("training", "Validation render", "Final trainer validation render", ["gs_result/renders/val_step7999_0000.png"]),
 ]
 
-TRAJECTORY_PREVIEW_LABELS = {
-    0: ("right rotation", "Camera rotates right from this split view."),
-    1: ("left rotation", "Camera rotates left from this split view."),
-    2: ("up-right aerial", "Camera pitches upward and rotates toward the right."),
-}
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -78,7 +108,128 @@ def safe_original_name(filename: str | None) -> str:
     return f"original_upload{suffix}"
 
 
-def prepare_job_files(run_dir: Path, filename: str | None, data: bytes, prompt: str) -> None:
+def uploaded_image_data(run_dir: Path) -> bytes:
+    candidates = sorted(
+        path
+        for path in run_dir.glob("original_upload.*")
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".img"}
+    )
+    panorama_path = run_dir / "panorama.png"
+    if panorama_path.exists() and panorama_path.is_file():
+        candidates.append(panorama_path)
+    if not candidates:
+        raise FileNotFoundError("Uploaded image is not available for prompt synthesis.")
+    return candidates[0].read_bytes()
+
+
+@dataclass(frozen=True)
+class PromptSynthesis:
+    prompt: str
+    source: str
+    error: str | None = None
+
+
+def compact_prompt_text(text: str) -> str:
+    return " ".join(text.replace("\n", " ").replace("\r", " ").split()).strip(" \"'")
+
+
+def normalize_generated_prompt(text: str) -> str:
+    prompt = compact_prompt_text(text)
+    if not prompt:
+        return AUTO_PROMPT_FALLBACK
+    return prompt[:700]
+
+
+def is_generic_generated_prompt(prompt: str) -> bool:
+    normalized = compact_prompt_text(prompt).lower()
+    if not normalized:
+        return True
+    if normalized == AUTO_PROMPT_FALLBACK.lower():
+        return True
+    return any(marker in normalized for marker in GENERIC_PROMPT_MARKERS)
+
+
+def is_placeholder_prompt(prompt: str) -> bool:
+    normalized = compact_prompt_text(prompt).lower()
+    return normalized in LEGACY_PROMPT_PLACEHOLDERS or is_generic_generated_prompt(prompt)
+
+
+def fallback_prompt(source: str, error: str) -> PromptSynthesis:
+    return PromptSynthesis(prompt=AUTO_PROMPT_FALLBACK, source=source, error=error)
+
+
+def synthesize_prompt_details(data: bytes) -> PromptSynthesis:
+    if os.environ.get("HYWORLD_AUTO_PROMPT", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return fallback_prompt("disabled", "Automatic LLM prompt generation is disabled.")
+
+    try:
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            preview = img.convert("RGB")
+    except (UnidentifiedImageError, OSError):
+        return fallback_prompt("invalid_image", "Upload must be a readable image file.")
+
+    preview.thumbnail(AUTO_PROMPT_IMAGE_SIZE, Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    preview.save(buffer, format="JPEG", quality=85)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    base_url = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8000/v1").strip()
+    api_key = os.environ.get("LLM_API_KEY", "EMPTY")
+    model = os.environ.get("LLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct").strip() or "Qwen/Qwen3-VL-8B-Instruct"
+    timeout = float(os.environ.get("HYWORLD_AUTO_PROMPT_TIMEOUT", "45"))
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a visual scene describer for image-conditioned 3D world generation. "
+                        "Write only what is directly visible in the image. Mention concrete objects, spatial layout, "
+                        "environment type, colors, lighting, material cues, and style. Never use generic category lists."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Describe this panorama as one compact English prompt, 35 to 70 words. "
+                                "It must include specific visible scene details such as what occupies the foreground, "
+                                "middle distance, background, and lighting. Do not say uploaded image, panorama, "
+                                "architecture/terrain/materials/objects as generic placeholders, or camera trajectory. "
+                                "If you cannot inspect the image, output exactly CANNOT_DESCRIBE."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                    ],
+                },
+            ],
+            max_tokens=160,
+            temperature=0.15,
+        )
+        raw_prompt = compact_prompt_text(response.choices[0].message.content or "")
+        if not raw_prompt or raw_prompt == "CANNOT_DESCRIBE":
+            return fallback_prompt("empty_response", "LLM did not return a scene description.")
+        prompt = normalize_generated_prompt(raw_prompt)
+        if is_generic_generated_prompt(prompt):
+            return fallback_prompt("generic_response", "LLM returned a generic prompt instead of visible scene details.")
+        return PromptSynthesis(prompt=prompt, source="llm")
+    except Exception as exc:
+        message = f"LLM request failed: {exc}"
+        logger.warning("Automatic prompt synthesis failed; using fallback prompt: %s", exc)
+        return fallback_prompt("error", message)
+
+
+def synthesize_prompt_from_image(data: bytes) -> str:
+    return synthesize_prompt_details(data).prompt
+
+
+def prepare_job_files(run_dir: Path, filename: str | None, data: bytes, prompt: str, indoor: bool = False) -> None:
     run_dir.mkdir(parents=True, exist_ok=False)
     if not data:
         raise ValueError("Uploaded file is empty.")
@@ -95,16 +246,37 @@ def prepare_job_files(run_dir: Path, filename: str | None, data: bytes, prompt: 
 
     panorama.save(run_dir / "panorama.png")
     (run_dir / "meta_info.json").write_text(
-        json.dumps({"scene_type": "outdoor", "prompt": prompt}, indent=2),
+        json.dumps({"scene_type": "indoor" if indoor else "outdoor", "prompt": prompt}, indent=2),
         encoding="utf-8",
     )
     (run_dir / "pipeline.log").touch()
 
 
-def artifact_path(run_dir: Path, name: str) -> tuple[Path, str]:
+def update_scene_type(run_dir: Path, prompt: str, indoor: bool) -> None:
+    meta_path = run_dir / "meta_info.json"
+    meta: dict[str, Any] = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["scene_type"] = "indoor" if indoor else "outdoor"
+    meta["prompt"] = prompt
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def gs_final_step(gs_max_steps: int) -> int:
+    return max(0, int(gs_max_steps) - 1)
+
+
+def artifact_path(run_dir: Path, name: str, gs_max_steps: int = DEFAULT_GS_MAX_STEPS) -> tuple[Path, str]:
     if name not in ARTIFACTS:
         raise KeyError(name)
     rel_path, media_type = ARTIFACTS[name]
+    final_step = gs_final_step(gs_max_steps)
+    if name == "point_cloud_7999.spz":
+        rel_path = f"gs_result/ply/point_cloud_{final_step}.spz"
+    elif name == "point_cloud_7999.ply":
+        rel_path = f"gs_result/ply/point_cloud_{final_step}.ply"
+    elif name == "ckpt_7999_rank0.pt":
+        rel_path = f"gs_result/ckpts/ckpt_{final_step}_rank0.pt"
     return run_dir / rel_path, media_type
 
 
@@ -146,9 +318,36 @@ def make_preview_item(job_id: str, run_dir: Path, item_id: str, stage: str, titl
     return item
 
 
-def split_view_preview_specs(split_view_num: int) -> list[tuple[str, str, str, str, list[str]]]:
+def sanitize_trajectory_modes(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return DEFAULT_TRAJECTORY_MODES.copy()
+    modes = value.split(",") if isinstance(value, str) else value
+    cleaned: list[str] = []
+    for mode in modes:
+        mode = str(mode).strip()
+        if not mode:
+            continue
+        if mode not in TRAJECTORY_MODE_LABELS:
+            raise ValueError(f"Unknown trajectory mode: {mode}")
+        cleaned.append(mode)
+    if not cleaned:
+        raise ValueError("At least one trajectory mode is required.")
+    if len(cleaned) > MAX_TRAJECTORY_MODES:
+        raise ValueError(f"At most {MAX_TRAJECTORY_MODES} trajectory modes are supported.")
+    return cleaned
+
+
+def sanitize_gs_max_steps(value: int) -> int:
+    steps = int(value)
+    if steps < MIN_GS_MAX_STEPS or steps > MAX_GS_MAX_STEPS:
+        raise ValueError(f"gs_max_steps must be between {MIN_GS_MAX_STEPS} and {MAX_GS_MAX_STEPS}.")
+    return steps
+
+
+def split_view_preview_specs(split_view_num: int, trajectory_modes: list[str] | None = None) -> list[tuple[str, str, str, str, list[str]]]:
     specs: list[tuple[str, str, str, str, list[str]]] = []
     split_count = max(1, min(int(split_view_num), 8))
+    modes = sanitize_trajectory_modes(trajectory_modes)
     for view_i in range(split_count):
         azimuth = round(view_i * 360.0 / split_count)
         specs.extend(
@@ -169,8 +368,8 @@ def split_view_preview_specs(split_view_num: int) -> list[tuple[str, str, str, s
                 ),
             ]
         )
-        for traj_i in range(3):
-            label, caption = TRAJECTORY_PREVIEW_LABELS.get(traj_i, (f"traj {traj_i}", "Generated camera trajectory."))
+        for traj_i, mode in enumerate(modes):
+            label, caption = TRAJECTORY_MODE_LABELS.get(mode, (f"traj {traj_i}", "Generated camera trajectory."))
             specs.extend(
                 [
                     (
@@ -199,15 +398,27 @@ def split_view_preview_specs(split_view_num: int) -> list[tuple[str, str, str, s
     return specs
 
 
-def preview_items(job_id: str, run_dir: Path, split_view_num: int = DEFAULT_SPLIT_VIEW_NUM) -> list[dict[str, Any]]:
+def preview_items(
+    job_id: str,
+    run_dir: Path,
+    split_view_num: int = DEFAULT_SPLIT_VIEW_NUM,
+    trajectory_modes: list[str] | None = None,
+    gs_max_steps: int = DEFAULT_GS_MAX_STEPS,
+    indoor: bool = False,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for index, (stage, title, description, candidates) in enumerate(PREVIEW_SPECS[:1]):
         items.append(make_preview_item(job_id, run_dir, f"{stage}-{index}", stage, title, description, candidates))
 
-    for item_id, stage, title, description, candidates in split_view_preview_specs(split_view_num):
+    for item_id, stage, title, description, candidates in split_view_preview_specs(split_view_num, trajectory_modes):
         items.append(make_preview_item(job_id, run_dir, item_id, stage, title, description, candidates))
 
+    final_step = gs_final_step(gs_max_steps)
     for index, (stage, title, description, candidates) in enumerate(PREVIEW_SPECS[1:], start=1):
+        if indoor and title == "Sky mask":
+            continue
+        if title == "Validation render":
+            candidates = [f"gs_result/renders/val_step{final_step}_0000.png", *candidates]
         items.append(make_preview_item(job_id, run_dir, f"{stage}-{index}", stage, title, description, candidates))
     return items
 
@@ -294,6 +505,11 @@ class Job:
     updated_at: str
     error: str | None = None
     split_view_num: int = DEFAULT_SPLIT_VIEW_NUM
+    trajectory_modes: list[str] = field(default_factory=lambda: DEFAULT_TRAJECTORY_MODES.copy())
+    indoor: bool = False
+    gs_max_steps: int = DEFAULT_GS_MAX_STEPS
+    prompt_source: str = "unknown"
+    prompt_error: str | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
@@ -323,6 +539,24 @@ class JobStore:
                 ]
                 if existing_views:
                     data["split_view_num"] = max(1, min(len(existing_views), 8))
+            if "trajectory_modes" not in data:
+                data["trajectory_modes"] = DEFAULT_TRAJECTORY_MODES.copy()
+            else:
+                try:
+                    data["trajectory_modes"] = sanitize_trajectory_modes(data["trajectory_modes"])
+                except ValueError:
+                    data["trajectory_modes"] = DEFAULT_TRAJECTORY_MODES.copy()
+            data.setdefault("indoor", False)
+            data.setdefault("gs_max_steps", DEFAULT_GS_MAX_STEPS)
+            data.setdefault("prompt_source", "unknown")
+            data.setdefault("prompt_error", None)
+            if data["prompt_source"] == "unknown" and is_placeholder_prompt(str(data.get("prompt", ""))):
+                data["prompt_source"] = "fallback"
+                data["prompt_error"] = "This prompt matches a generic placeholder rather than an LLM scene description."
+            try:
+                data["gs_max_steps"] = sanitize_gs_max_steps(data["gs_max_steps"])
+            except ValueError:
+                data["gs_max_steps"] = DEFAULT_GS_MAX_STEPS
             job = Job(**data)
             loaded_jobs[job.id] = job
         self.jobs = loaded_jobs
@@ -330,7 +564,7 @@ class JobStore:
         reconciled_jobs: list[Job] = []
         for job in list(self.jobs.values()):
             if job.state in {"queued", "running"}:
-                spz_path, _ = artifact_path(Path(job.run_dir), "point_cloud_7999.spz")
+                spz_path, _ = artifact_path(Path(job.run_dir), "point_cloud_7999.spz", job.gs_max_steps)
                 if spz_path.exists():
                     job.state = "succeeded"
                     job.stage = "complete"
@@ -359,7 +593,8 @@ class JobStore:
 class JobManager:
     def __init__(self, store: JobStore):
         self.store = store
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        self.queue_tokens: dict[str, int] = {}
         self.subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self.log_tails: dict[str, deque[str]] = {}
         self.active_process: asyncio.subprocess.Process | None = None
@@ -384,10 +619,17 @@ class JobManager:
         self.store.save(job)
         self.publish(job.id, {"type": "status", "job": job.public()})
 
-    def start_job(self, job: Job, split_view_num: int) -> None:
+    def start_job(self, job: Job, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> None:
         job.split_view_num = split_view_num
-        self.update(job, state="queued", stage="queued", progress=f"Waiting for the GPU pipeline. split_view_num={split_view_num}.")
-        self.queue.put_nowait(job.id)
+        job.trajectory_modes = trajectory_modes
+        job.indoor = indoor
+        job.gs_max_steps = gs_max_steps
+        job.error = None
+        queue_token = self.queue_tokens.get(job.id, 0) + 1
+        self.queue_tokens[job.id] = queue_token
+        mode_text = ",".join(trajectory_modes)
+        self.update(job, state="queued", stage="queued", progress=f"Waiting for the GPU pipeline. split_view_num={split_view_num}, trajectory_modes={mode_text}, gs_max_steps={gs_max_steps}.")
+        self.queue.put_nowait((job.id, queue_token))
 
     def update(self, job: Job, *, state: str | None = None, stage: str | None = None, progress: str | None = None, error: str | None = None) -> None:
         if state is not None:
@@ -407,7 +649,7 @@ class JobManager:
         run_dir = Path(job.run_dir)
         artifacts: dict[str, str] = {}
         for name in ("panorama.png", "point_cloud_7999.spz", "point_cloud_7999.ply", "ckpt_7999_rank0.pt", "pipeline.log"):
-            path, _ = artifact_path(run_dir, name)
+            path, _ = artifact_path(run_dir, name, job.gs_max_steps)
             if path.exists():
                 artifacts[name] = f"/api/jobs/{job.id}/artifacts/{name}"
         job.artifacts = artifacts
@@ -438,10 +680,10 @@ class JobManager:
 
     async def worker(self) -> None:
         while True:
-            job_id = await self.queue.get()
+            job_id, queue_token = await self.queue.get()
             try:
                 job = self.store.jobs.get(job_id)
-                if not job or job.state == "canceled":
+                if not job or job.state == "canceled" or self.queue_tokens.get(job_id) != queue_token:
                     continue
                 await self.run_job(job)
             finally:
@@ -450,14 +692,16 @@ class JobManager:
     async def run_job(self, job: Job) -> None:
         self.active_job_id = job.id
         try:
-            self.update(job, state="running", stage="starting", progress="Preparing HY-World pipeline.")
-            for stage, cwd, command in pipeline_commands(Path(job.run_dir), job.prompt, job.split_view_num):
+            self.update(job, state="running", stage="prompt synthesis", progress="Generating scene prompt from the uploaded image.")
+            await self.synthesize_job_prompt(job)
+            self.update(job, stage="starting", progress="Preparing HY-World pipeline.")
+            for stage, cwd, command in pipeline_commands(Path(job.run_dir), job.prompt, job.split_view_num, job.trajectory_modes, job.gs_max_steps):
                 if job.state == "canceled":
                     self.update(job, stage="canceled", progress="Job canceled.")
                     return
                 await self.run_stage(job, stage, cwd, command)
 
-            spz_path, _ = artifact_path(Path(job.run_dir), "point_cloud_7999.spz")
+            spz_path, _ = artifact_path(Path(job.run_dir), "point_cloud_7999.spz", job.gs_max_steps)
             if not spz_path.exists():
                 raise RuntimeError("Pipeline finished without gs_result/ply/point_cloud_7999.spz.")
             self.update(job, state="succeeded", stage="complete", progress="SPZ export is ready.")
@@ -471,6 +715,26 @@ class JobManager:
         finally:
             self.active_process = None
             self.active_job_id = None
+
+    async def synthesize_job_prompt(self, job: Job) -> None:
+        if job.prompt_source == "llm" and job.prompt.strip():
+            update_scene_type(Path(job.run_dir), job.prompt, job.indoor)
+            return
+
+        data = await asyncio.to_thread(uploaded_image_data, Path(job.run_dir))
+        prompt_synthesis = await asyncio.to_thread(synthesize_prompt_details, data)
+        job.prompt = prompt_synthesis.prompt
+        job.prompt_source = prompt_synthesis.source
+        job.prompt_error = prompt_synthesis.error
+        update_scene_type(Path(job.run_dir), job.prompt, job.indoor)
+        if prompt_synthesis.source == "llm":
+            self.update(job, stage="prompt synthesis", progress="Generated scene prompt from the uploaded image.")
+        else:
+            self.update(
+                job,
+                stage="prompt synthesis",
+                progress=f"Using fallback prompt because LLM prompt synthesis did not produce a scene description: {prompt_synthesis.error}",
+            )
 
     async def run_stage(self, job: Job, stage: str, cwd: Path, command: list[str]) -> None:
         self.update(job, stage=stage, progress=f"Starting {stage}.")
@@ -500,6 +764,7 @@ class JobManager:
                 log.write(text)
                 log.flush()
 
+                self.publish(job.id, {"type": "log_chunk", "chunk": text})
                 buffered_line = self.publish_log_text(job, buffered_line + text)
                 if job.state == "canceled":
                     await self.terminate_process(process)
@@ -560,11 +825,23 @@ class JobManager:
             await process.wait()
 
 
-def pipeline_commands(scene_dir: Path, prompt: str, split_view_num: int = DEFAULT_SPLIT_VIEW_NUM) -> list[tuple[str, Path, list[str]]]:
+def pipeline_commands(
+    scene_dir: Path,
+    prompt: str,
+    split_view_num: int = DEFAULT_SPLIT_VIEW_NUM,
+    trajectory_modes: list[str] | None = None,
+    gs_max_steps: int = DEFAULT_GS_MAX_STEPS,
+) -> list[tuple[str, Path, list[str]]]:
     scene = str(scene_dir)
     split_views = str(max(1, min(int(split_view_num), 8)))
+    modes = ",".join(sanitize_trajectory_modes(trajectory_modes))
+    gs_steps = str(sanitize_gs_max_steps(gs_max_steps))
     return [
-        ("trajectory generation", WORLDGEN_DIR, ["python", "traj_generate.py", "--target_path", scene, "--split_view_num", split_views]),
+        (
+            "trajectory generation",
+            WORLDGEN_DIR,
+            ["python", "traj_generate.py", "--target_path", scene, "--split_view_num", split_views, "--trajectory_modes", modes],
+        ),
         ("trajectory rendering", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "traj_render.py", "--target_path", scene]),
         ("caption writing", ROOT_DIR, ["python", "scripts/write_traj_captions.py", "--target-path", scene, "--prompt", prompt]),
         ("video generation", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "video_gen.py", "--target_path", scene]),
@@ -582,13 +859,13 @@ def pipeline_commands(scene_dir: Path, prompt: str, split_view_num: int = DEFAUL
                 "--result_dir",
                 f"{scene}/gs_result",
                 "--max_steps",
-                "8000",
+                gs_steps,
                 "--save_steps",
-                "8000",
+                gs_steps,
                 "--eval_steps",
-                "8000",
+                gs_steps,
                 "--ply_steps",
-                "8000",
+                gs_steps,
                 "--save_ply",
                 "--convert_to_spz",
                 "--disable_video",
@@ -651,16 +928,23 @@ async def shutdown() -> None:
 @app.post("/api/jobs")
 async def create_job(
     file: UploadFile = File(...),
-    prompt: str = Form("uploaded panorama"),
     split_view_num: int = Form(DEFAULT_SPLIT_VIEW_NUM),
+    trajectory_modes: str = Form(",".join(DEFAULT_TRAJECTORY_MODES)),
+    indoor: bool = Form(False),
+    gs_max_steps: int = Form(DEFAULT_GS_MAX_STEPS),
 ):
     if split_view_num < 1 or split_view_num > 8:
         raise HTTPException(status_code=400, detail="split_view_num must be between 1 and 8.")
+    try:
+        selected_modes = sanitize_trajectory_modes(trajectory_modes)
+        selected_gs_max_steps = sanitize_gs_max_steps(gs_max_steps)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = make_job_id()
     run_dir = OUTPUT_ROOT / job_id
     data = await file.read()
     try:
-        prepare_job_files(run_dir, file.filename, data, prompt or "uploaded panorama")
+        prepare_job_files(run_dir, file.filename, data, "", indoor=indoor)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -670,11 +954,16 @@ async def create_job(
         state="ready",
         stage="uploaded",
         progress="Panorama uploaded. Set split views and start.",
-        prompt=prompt or "uploaded panorama",
+        prompt="",
         run_dir=str(run_dir),
         created_at=now,
         updated_at=now,
         split_view_num=split_view_num,
+        trajectory_modes=selected_modes,
+        indoor=indoor,
+        gs_max_steps=selected_gs_max_steps,
+        prompt_source="not_started",
+        prompt_error=None,
     )
     manager.refresh_artifacts(job)
     manager.add_job(job)
@@ -682,16 +971,27 @@ async def create_job(
 
 
 @app.post("/api/jobs/{job_id}/start")
-async def start_job(job_id: str, split_view_num: int | None = None):
+async def start_job(
+    job_id: str,
+    split_view_num: int | None = None,
+    trajectory_modes: str | None = None,
+    indoor: bool | None = None,
+    gs_max_steps: int | None = None,
+):
     job = store.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    if job.state != "ready":
-        raise HTTPException(status_code=409, detail=f"Job is {job.state}, not ready.")
+    if job.state not in {"ready", "failed", "canceled"}:
+        raise HTTPException(status_code=409, detail=f"Job is {job.state}, not startable.")
     split_view_num = job.split_view_num if split_view_num is None else split_view_num
     if split_view_num < 1 or split_view_num > 8:
         raise HTTPException(status_code=400, detail="split_view_num must be between 1 and 8.")
-    manager.start_job(job, split_view_num)
+    try:
+        selected_modes = sanitize_trajectory_modes(job.trajectory_modes if trajectory_modes is None else trajectory_modes)
+        selected_gs_max_steps = sanitize_gs_max_steps(job.gs_max_steps if gs_max_steps is None else gs_max_steps)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    manager.start_job(job, split_view_num, selected_modes, job.indoor if indoor is None else indoor, selected_gs_max_steps)
     return job.public()
 
 
@@ -736,7 +1036,7 @@ async def get_artifact(job_id: str, name: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
-        path, media_type = artifact_path(Path(job.run_dir), name)
+        path, media_type = artifact_path(Path(job.run_dir), name, job.gs_max_steps)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Artifact not found.") from exc
     if not path.exists():
@@ -753,7 +1053,7 @@ async def get_previews(job_id: str):
     job = store.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return preview_items(job.id, Path(job.run_dir), job.split_view_num)
+    return preview_items(job.id, Path(job.run_dir), job.split_view_num, job.trajectory_modes, job.gs_max_steps, job.indoor)
 
 
 @app.get("/api/jobs/{job_id}/preview-files/{rel_path:path}")
