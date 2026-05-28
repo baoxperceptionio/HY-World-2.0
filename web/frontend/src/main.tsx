@@ -544,7 +544,6 @@ function App() {
           : currentJob && promptSource !== "unknown"
           ? `${promptError || "LLM did not produce a scene-specific description."} The pipeline is using a generic fallback prompt.`
           : "Upload an image, then click Start to generate the scene description.";
-  const promptLabel = promptSource === "llm" ? "LLM prompt" : promptSource === "unknown" ? "Auto prompt" : "Fallback prompt";
   const splatUrl = currentJob?.state === "succeeded" && currentJob.artifacts["point_cloud_7999.spz"]
     ? absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"])
     : null;
@@ -874,12 +873,6 @@ function App() {
             </span>
             <h2>{currentJob?.stage ?? "Ready"}</h2>
             <p>{currentJob?.progress ?? "Upload a panorama to start."}</p>
-            {currentJob?.prompt && (
-              <p className={`prompt-line ${promptSource === "llm" ? "" : "fallback"}`}>
-                <span>{promptLabel}</span>
-                {currentJob.prompt}
-              </p>
-            )}
           </div>
           <div className="actions">
             {currentJob && STARTABLE_JOB_STATES.has(currentJob.state) && (

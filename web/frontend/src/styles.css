@@ -347,26 +347,6 @@ p {
   overflow-wrap: anywhere;
 }
 
-.prompt-line {
-  margin-top: 8px;
-  color: #c7d5df;
-  font-size: 13px;
-}
-
-.prompt-line span {
-  margin-right: 8px;
-  color: #7f929f;
-  font-size: 12px;
-}
-
-.prompt-line.fallback {
-  color: #f3c98d;
-}
-
-.prompt-line.fallback span {
-  color: #d69d58;
-}
-
 .state-pill {
   width: fit-content;
   display: inline-flex;
