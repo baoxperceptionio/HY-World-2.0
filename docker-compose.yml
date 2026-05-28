@@ -4,9 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        BASE_IMAGE: ${HYWORLD_BASE_IMAGE:-hyworld2:cuda12.8-gh200}
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
         MAX_JOBS: ${MAX_JOBS:-8}
-    image: hyworld2:cuda12.8-gh200
+    image: hyworld2:cuda12.8-gh200-mounted
     container_name: hyworld2
     working_dir: /workspace/HY-World-2.0
     network_mode: host
@@ -30,7 +31,12 @@ services:
       WANDB_DIR: /workspace/.cache/wandb
       HF_TOKEN: ${HF_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:8000/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-EMPTY}
+      LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
       PYTHONPATH: /workspace/HY-World-2.0:/workspace/HY-World-2.0/hyworld2:/workspace/HY-World-2.0/hyworld2/worldgen:/workspace/HY-World-2.0/hyworld2/panogen
+      HYWORLD_ROOT: /workspace/HY-World-2.0
+      HYWORLD_DISABLE_SAM3: ${HYWORLD_DISABLE_SAM3:-1}
       HYWORLD_CMD: ${HYWORLD_CMD:-}
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-8}
@@ -39,13 +45,72 @@ services:
       - ${HF_HOME_HOST:-/home/ubuntu/.cache/huggingface}:/workspace/.cache/huggingface
       - hyworld2-cache:/workspace/.cache
     command: >
-      bash -lc 'if [ -n "$$HYWORLD_CMD" ]; then
-      exec bash -lc "$$HYWORLD_CMD";
-      else
-      exec sleep infinity;
-      fi'
+      bash scripts/docker_entrypoint.sh
     stdin_open: true
     tty: true
 
+  hyworld2-web-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${HYWORLD_BASE_IMAGE:-hyworld2:cuda12.8-gh200}
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+        MAX_JOBS: ${MAX_JOBS:-8}
+    image: hyworld2:cuda12.8-gh200-mounted
+    container_name: hyworld2-web-api
+    working_dir: /workspace/HY-World-2.0
+    network_mode: host
+    gpus: all
+    ipc: host
+    shm_size: "64gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics}
+      TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+      MAX_JOBS: ${MAX_JOBS:-8}
+      FORCE_CUDA: "1"
+      CUDA_HOME: /usr/local/cuda
+      HF_HOME: /workspace/.cache/huggingface
+      HF_HUB_CACHE: /workspace/.cache/huggingface/hub
+      TORCH_HOME: /workspace/.cache/torch
+      MPLCONFIGDIR: /workspace/.cache/matplotlib
+      WANDB_DIR: /workspace/.cache/wandb
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:8000/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-EMPTY}
+      LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      PYTHONPATH: /workspace/HY-World-2.0:/workspace/HY-World-2.0/hyworld2:/workspace/HY-World-2.0/hyworld2/worldgen:/workspace/HY-World-2.0/hyworld2/panogen
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-8}
+      HYWORLD_ROOT: /workspace/HY-World-2.0
+      HYWORLD_DISABLE_SAM3: ${HYWORLD_DISABLE_SAM3:-1}
+    volumes:
+      - .:/workspace/HY-World-2.0
+      - ${HF_HOME_HOST:-/home/ubuntu/.cache/huggingface}:/workspace/.cache/huggingface
+      - hyworld2-cache:/workspace/.cache
+    command: >
+      bash scripts/docker_entrypoint.sh uvicorn web.backend.main:app --host 0.0.0.0 --port 8080
+
+  hyworld2-web-ui:
+    image: node:22-bookworm-slim
+    container_name: hyworld2-web-ui
+    working_dir: /workspace/HY-World-2.0/web/frontend
+    network_mode: host
+    environment:
+      VITE_API_PROXY_TARGET: http://127.0.0.1:${HYWORLD_API_PORT:-8080}
+    volumes:
+      - .:/workspace/HY-World-2.0
+      - hyworld2-web-node-modules:/workspace/HY-World-2.0/web/frontend/node_modules
+    command: >
+      bash -lc 'npm install && exec npm run dev -- --host 0.0.0.0 --port ${HYWORLD_UI_PORT:-8058}'
+    depends_on:
+      - hyworld2-web-api
+
 volumes:
   hyworld2-cache:
+  hyworld2-web-node-modules:

@@ -8,6 +8,10 @@ peft==0.18.1
 safetensors
 zim_anything
 tensorboard
+fastapi
+uvicorn[standard]
+python-multipart
+pytest
 
 # Model utilities
 omegaconf

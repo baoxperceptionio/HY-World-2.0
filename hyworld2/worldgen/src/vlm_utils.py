@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 
 import numpy as np
 from openai import OpenAI
@@ -8,6 +9,25 @@ from openai import OpenAI
 from .general_utils import load_video
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走，阳光，明亮"
+
+
+def resolve_llm_base_url(llm_addr=None, llm_port=None):
+    base_url = os.environ.get("LLM_BASE_URL", "").strip()
+    if base_url:
+        return base_url
+    return f"http://{llm_addr}:{llm_port}/v1"
+
+
+def resolve_llm_api_key():
+    return os.environ.get("LLM_API_KEY", "EMPTY")
+
+
+def resolve_llm_model_name(default_model_name):
+    return os.environ.get("LLM_MODEL", default_model_name).strip() or default_model_name
+
+
+def create_openai_client(llm_addr=None, llm_port=None):
+    return OpenAI(api_key=resolve_llm_api_key(), base_url=resolve_llm_base_url(llm_addr, llm_port))
 
 
 def parse_selected_indices_and_reasons(text):
@@ -147,7 +167,8 @@ def get_qwen_caption_format(task_type, sampled_images=None, desc_str_insert=None
 
 
 def get_traj_caption(LLM_ADDR, LLM_PORT, MODEL_NAME, traj_path, sample_count=8):
-    client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
+    client = create_openai_client(LLM_ADDR, LLM_PORT)
+    model_name = resolve_llm_model_name(MODEL_NAME)
     prompt_text = ("Please generate a descriptive caption for the provided video, focusing strictly on the visual content of the scene while ignoring rendering artifacts. "
                    "1. Initial Scene Description: Start by providing a detailed description of the first frame. Specifically analyze the landscape, the style and material of the huts/tents, "
                    "the campfire, the texture of the ground, and the distant mountain range. 2. Camera Movement & New Elements: Briefly describe the camera movement "
@@ -183,7 +204,7 @@ def get_traj_caption(LLM_ADDR, LLM_PORT, MODEL_NAME, traj_path, sample_count=8):
         {"role": "user", "content": content_list}
     ]
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model_name,
         messages=messages,
         max_tokens=1024,  # Adjust max_tokens to keep it concise
         temperature=0.1,
