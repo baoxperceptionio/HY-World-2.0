@@ -234,6 +234,10 @@ p {
   padding: 0 12px;
 }
 
+.spz-download-button {
+  white-space: nowrap;
+}
+
 .secondary-button {
   background: #29191e;
   border-color: #8e3d4c;

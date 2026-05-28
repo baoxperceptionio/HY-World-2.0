@@ -48,6 +48,7 @@ if __name__ == '__main__':
     # Multi-node sharding params.
     parser.add_argument("--node_rank", type=int, default=0, help="local rank for multi-node")
     parser.add_argument("--node_size", type=int, default=1, help="world size for multi-node")
+    parser.add_argument("--skip_exist", action="store_true", help="skip trajectories whose render outputs already exist")
 
     # VLM server params
     parser.add_argument("--llm_addr", type=str, default=LLM_ADDR, help="vLLM server address")
@@ -95,6 +96,8 @@ if __name__ == '__main__':
         for traj_path in tqdm(traj_list, desc="Rendering Trajectories...", disable=rank != 0):
             if not os.path.exists(f"{traj_path}/camera.json"):
                 continue
+            if args.skip_exist and os.path.exists(f"{traj_path}/render.mp4") and os.path.exists(f"{traj_path}/render_mask.mp4"):
+                continue
 
             with open(f"{traj_path}/camera.json", "r") as f:
                 camera_info = json.load(f)
@@ -137,6 +140,8 @@ if __name__ == '__main__':
         if rank == 0:
             total_render_list = glob(f"{scene_path}/render_results/*/traj*/render.mp4")
             total_render_list = [path for path in total_render_list if not (path.split("/")[-3].startswith("reconstruct_") and path.split("/")[-2] == "traj1")]
+            if args.skip_exist:
+                total_render_list = [path for path in total_render_list if not os.path.exists(path.replace('/render.mp4', '/traj_caption.json'))]
 
             if total_render_list:
                 with timer.track("vllm Qwen3-VL trajectory caption (parallel)"):

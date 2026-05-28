@@ -30,6 +30,42 @@ def is_sam3_disabled():
     return os.environ.get("HYWORLD_DISABLE_SAM3", "0").lower() in {"1", "true", "yes", "on"}
 
 
+def cuda_memory_status(device):
+    if not torch.cuda.is_available():
+        return "CUDA unavailable"
+    free, total = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    gb = 1024 ** 3
+    return (
+        f"allocated={allocated / gb:.2f}GB, reserved={reserved / gb:.2f}GB, "
+        f"free={free / gb:.2f}GB, total={total / gb:.2f}GB"
+    )
+
+
+def load_worldstereo(args, sp_size, device_mesh, device):
+    worldstereo = WorldStereo.from_pretrained(
+        "hanshanxue/WorldStereo",
+        subfolder=args.model_type,
+        local_files_only=args.local_files_only,
+        sp_world_size=sp_size,
+        fsdp=args.fsdp,
+        device_mesh=device_mesh,
+        device=device,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    rank0_log(f"WorldStereo CUDA memory: {cuda_memory_status(device)}")
+    return worldstereo
+
+
+def cleanup_cuda_after_release(device, label):
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+    rank0_log(f"After releasing {label}: {cuda_memory_status(device)}")
+
+
 if __name__ == '__main__':
     # == parse configs ==
     parser = argparse.ArgumentParser()
@@ -98,16 +134,8 @@ if __name__ == '__main__':
     torch.set_default_dtype(torch.float)
 
     # == Video Generation Inference ==
-    worldstereo = WorldStereo.from_pretrained(
-        "hanshanxue/WorldStereo",
-        subfolder=args.model_type,
-        local_files_only=args.local_files_only,
-        sp_world_size=sp_size,
-        fsdp=args.fsdp,
-        device_mesh=device_mesh,
-        device=device,
-    )
-    dist.barrier()
+    # Load lazily per active scene so World Mirror can reuse the GPU after generation.
+    worldstereo = None
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     # Auto-select autocast precision: prefer bf16, then fp16, fall back to fp32 (disable autocast)
@@ -143,6 +171,11 @@ if __name__ == '__main__':
             if os.path.exists(f"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply") and args.skip_exist:
                 rank0_log(f"Scene {scene.split('/')[-1]}: aligned_pcd.ply exists, skip.")
                 continue
+
+            if worldstereo is None:
+                with timer.track("Load WorldStereo"):
+                    worldstereo = load_worldstereo(args, sp_size, device_mesh, device)
+                dist.barrier()
 
             width, height = imagesize.get(f"{'/'.join(render_list[0].split('/')[:-2])}/start_frame.png")
             rank0_log("Enable memory control, initializing memory bank.")
@@ -224,6 +257,13 @@ if __name__ == '__main__':
                 dist.barrier()
 
             if memory_bank is not None:
+                if worldstereo is not None:
+                    rank0_log("Releasing WorldStereo before World Mirror.")
+                    del worldstereo
+                    worldstereo = None
+                    cleanup_cuda_after_release(device, "WorldStereo")
+                dist.barrier()
+
                 with timer.track("Run World Mirror"):
                     memory_bank.apply_worldmirror(skip_exist=True)
                 dist.barrier()

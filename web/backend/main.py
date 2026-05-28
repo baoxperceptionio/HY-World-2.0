@@ -1,12 +1,12 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math
 import mimetypes
 import os
 import signal
-import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -96,9 +96,30 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def make_job_id() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{stamp}_{uuid.uuid4().hex[:8]}"
+def canonical_task_params(split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> dict[str, Any]:
+    return {
+        "split_view_num": max(1, min(int(split_view_num), 8)),
+        "trajectory_modes": sanitize_trajectory_modes(trajectory_modes),
+        "indoor": bool(indoor),
+        "gs_max_steps": sanitize_gs_max_steps(gs_max_steps),
+    }
+
+
+def task_hash(data: bytes, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> tuple[str, str, dict[str, Any]]:
+    image_sha256 = hashlib.sha256(data).hexdigest()
+    params = canonical_task_params(split_view_num, trajectory_modes, indoor, gs_max_steps)
+    payload = {
+        "version": 1,
+        "image_sha256": image_sha256,
+        "params": params,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return digest, image_sha256, params
+
+
+def make_job_id(data: bytes, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> str:
+    digest, _, _ = task_hash(data, split_view_num, trajectory_modes, indoor, gs_max_steps)
+    return f"task_{digest[:20]}"
 
 
 def safe_original_name(filename: str | None) -> str:
@@ -313,8 +334,9 @@ def make_preview_item(job_id: str, run_dir: Path, item_id: str, stage: str, titl
         "updated_at": None,
     }
     if selected and selected_rel:
-        item["url"] = f"/api/jobs/{job_id}/preview-files/{quote(selected_rel, safe='/')}"
-        item["updated_at"] = datetime.fromtimestamp(selected.stat().st_mtime, timezone.utc).isoformat()
+        stat = selected.stat()
+        item["url"] = f"/api/jobs/{job_id}/preview-files/{quote(selected_rel, safe='/')}?v={stat.st_mtime_ns}"
+        item["updated_at"] = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
     return item
 
 
@@ -510,6 +532,9 @@ class Job:
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS
     prompt_source: str = "unknown"
     prompt_error: str | None = None
+    input_hash: str | None = None
+    input_image_sha256: str | None = None
+    input_params: dict[str, Any] | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
@@ -550,6 +575,9 @@ class JobStore:
             data.setdefault("gs_max_steps", DEFAULT_GS_MAX_STEPS)
             data.setdefault("prompt_source", "unknown")
             data.setdefault("prompt_error", None)
+            data.setdefault("input_hash", None)
+            data.setdefault("input_image_sha256", None)
+            data.setdefault("input_params", None)
             if data["prompt_source"] == "unknown" and is_placeholder_prompt(str(data.get("prompt", ""))):
                 data["prompt_source"] = "fallback"
                 data["prompt_error"] = "This prompt matches a generic placeholder rather than an LLM scene description."
@@ -590,6 +618,44 @@ class JobStore:
         return sorted(self.jobs.values(), key=lambda job: job.created_at, reverse=True)[:limit]
 
 
+def make_job_record(
+    *,
+    job_id: str,
+    run_dir: Path,
+    split_view_num: int,
+    trajectory_modes: list[str],
+    indoor: bool,
+    gs_max_steps: int,
+    input_hash_value: str | None,
+    input_image_sha256: str | None,
+    input_params: dict[str, Any] | None,
+    prompt: str = "",
+    prompt_source: str = "not_started",
+    prompt_error: str | None = None,
+    progress: str = "Panorama uploaded. Set split views and start.",
+) -> Job:
+    now = utc_now()
+    return Job(
+        id=job_id,
+        state="ready",
+        stage="uploaded",
+        progress=progress,
+        prompt=prompt,
+        run_dir=str(run_dir),
+        created_at=now,
+        updated_at=now,
+        split_view_num=split_view_num,
+        trajectory_modes=trajectory_modes,
+        indoor=indoor,
+        gs_max_steps=gs_max_steps,
+        prompt_source=prompt_source,
+        prompt_error=prompt_error,
+        input_hash=input_hash_value,
+        input_image_sha256=input_image_sha256,
+        input_params=input_params,
+    )
+
+
 class JobManager:
     def __init__(self, store: JobStore):
         self.store = store
@@ -597,6 +663,7 @@ class JobManager:
         self.queue_tokens: dict[str, int] = {}
         self.subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self.log_tails: dict[str, deque[str]] = {}
+        self.preview_signatures: dict[str, set[str]] = {}
         self.active_process: asyncio.subprocess.Process | None = None
         self.active_job_id: str | None = None
         self.worker_task: asyncio.Task[None] | None = None
@@ -616,6 +683,7 @@ class JobManager:
 
     def add_job(self, job: Job) -> None:
         self.log_tails[job.id] = deque(maxlen=300)
+        self.preview_signatures[job.id] = self.available_preview_signatures(job)
         self.store.save(job)
         self.publish(job.id, {"type": "status", "job": job.public()})
 
@@ -663,6 +731,60 @@ class JobManager:
                     pass
             queue.put_nowait(payload)
 
+    def available_preview_signatures(self, job: Job, items: list[dict[str, Any]] | None = None) -> set[str]:
+        items = items if items is not None else preview_items(
+            job.id,
+            Path(job.run_dir),
+            job.split_view_num,
+            job.trajectory_modes,
+            job.gs_max_steps,
+            job.indoor,
+        )
+        return {
+            f"{item['id']}|{item.get('path') or ''}|{item.get('updated_at') or ''}"
+            for item in items
+            if item.get("available")
+        }
+
+    def publish_preview_updates(self, job: Job, reason: str = "file_available") -> None:
+        items = preview_items(
+            job.id,
+            Path(job.run_dir),
+            job.split_view_num,
+            job.trajectory_modes,
+            job.gs_max_steps,
+            job.indoor,
+        )
+        current = self.available_preview_signatures(job, items)
+        previous = self.preview_signatures.setdefault(job.id, set())
+        if not current - previous:
+            return
+        self.preview_signatures[job.id] = current
+        self.publish(
+            job.id,
+            {
+                "type": "preview_update",
+                "job": job.public(),
+                "reason": reason,
+                "previews": items,
+            },
+        )
+
+    async def monitor_preview_files(self, job: Job, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                self.publish_preview_updates(job)
+            except Exception as exc:
+                logger.warning("Could not publish preview update for %s: %s", job.id, exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        try:
+            self.publish_preview_updates(job)
+        except Exception as exc:
+            logger.warning("Could not publish final preview update for %s: %s", job.id, exc)
+
     async def subscribe(self, job_id: str):
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=200)
         self.subscribers.setdefault(job_id, set()).add(queue)
@@ -699,6 +821,9 @@ class JobManager:
                 if job.state == "canceled":
                     self.update(job, stage="canceled", progress="Job canceled.")
                     return
+                if self.stage_is_complete(job, stage):
+                    await self.skip_stage(job, stage)
+                    continue
                 await self.run_stage(job, stage, cwd, command)
 
             spz_path, _ = artifact_path(Path(job.run_dir), "point_cloud_7999.spz", job.gs_max_steps)
@@ -715,6 +840,42 @@ class JobManager:
         finally:
             self.active_process = None
             self.active_job_id = None
+
+    def expected_trajectory_dirs(self, job: Job) -> list[Path]:
+        render_root = Path(job.run_dir) / "render_results"
+        modes = sanitize_trajectory_modes(job.trajectory_modes)
+        return [
+            render_root / f"view{view_i}" / f"traj{traj_i}"
+            for view_i in range(max(1, min(int(job.split_view_num), 8)))
+            for traj_i in range(len(modes))
+        ]
+
+    def stage_is_complete(self, job: Job, stage: str) -> bool:
+        run_dir = Path(job.run_dir)
+        traj_dirs = self.expected_trajectory_dirs(job)
+        if stage == "trajectory generation":
+            return bool(traj_dirs) and all((path / "camera.json").exists() for path in traj_dirs)
+        if stage == "trajectory rendering":
+            return bool(traj_dirs) and all((path / "render.mp4").exists() and (path / "render_mask.mp4").exists() for path in traj_dirs)
+        if stage == "caption writing":
+            render_paths = [path / "render.mp4" for path in traj_dirs]
+            return bool(render_paths) and all(path.exists() and path.with_name("traj_caption.json").exists() for path in render_paths)
+        if stage == "video generation":
+            return (run_dir / "render_results" / "generation_bank_worldstereo-memory-dmd" / "aligned_pcd.ply").exists()
+        if stage == "GS data generation":
+            return (run_dir / "gs_data" / "cameras.json").exists()
+        if stage.endswith("GS training"):
+            spz_path, _ = artifact_path(run_dir, "point_cloud_7999.spz", job.gs_max_steps)
+            return spz_path.exists()
+        return False
+
+    async def skip_stage(self, job: Job, stage: str) -> None:
+        message = f"Reusing existing outputs for {stage}."
+        self.update(job, stage=stage, progress=message)
+        log_path = Path(job.run_dir) / "pipeline.log"
+        with log_path.open("a", encoding="utf-8", errors="replace") as log:
+            log.write(f"\n\n# {message}\n")
+        self.publish_log_line(job, message)
 
     async def synthesize_job_prompt(self, job: Job) -> None:
         if job.prompt_source == "llm" and job.prompt.strip():
@@ -738,46 +899,57 @@ class JobManager:
 
     async def run_stage(self, job: Job, stage: str, cwd: Path, command: list[str]) -> None:
         self.update(job, stage=stage, progress=f"Starting {stage}.")
+        stop_preview_monitor = asyncio.Event()
+        preview_monitor = asyncio.create_task(self.monitor_preview_files(job, stop_preview_monitor))
         log_path = Path(job.run_dir) / "pipeline.log"
-        with log_path.open("a", encoding="utf-8", errors="replace") as log:
-            log.write(f"\n\n$ {' '.join(command)}\n")
-            log.flush()
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            env["HYWORLD_DISABLE_SAM3"] = os.environ.get("HYWORLD_DISABLE_SAM3", "1")
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(cwd),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                preexec_fn=os.setsid,
-            )
-            self.active_process = process
-            assert process.stdout is not None
-            buffered_line = ""
-            while True:
-                raw_chunk = await process.stdout.read(8192)
-                if not raw_chunk:
-                    break
-                text = raw_chunk.decode("utf-8", errors="replace")
-                log.write(text)
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as log:
+                log.write(f"\n\n$ {' '.join(command)}\n")
                 log.flush()
+                env = os.environ.copy()
+                env["PYTHONUNBUFFERED"] = "1"
+                env["HYWORLD_DISABLE_SAM3"] = os.environ.get("HYWORLD_DISABLE_SAM3", "1")
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    preexec_fn=os.setsid,
+                )
+                self.active_process = process
+                assert process.stdout is not None
+                buffered_line = ""
+                while True:
+                    raw_chunk = await process.stdout.read(8192)
+                    if not raw_chunk:
+                        break
+                    text = raw_chunk.decode("utf-8", errors="replace")
+                    log.write(text)
+                    log.flush()
 
-                self.publish(job.id, {"type": "log_chunk", "chunk": text})
-                buffered_line = self.publish_log_text(job, buffered_line + text)
+                    self.publish(job.id, {"type": "log_chunk", "chunk": text})
+                    buffered_line = self.publish_log_text(job, buffered_line + text)
+                    self.publish_preview_updates(job, reason=stage)
+                    if job.state == "canceled":
+                        await self.terminate_process(process)
+                        break
+                if buffered_line:
+                    self.publish_log_line(job, buffered_line.rstrip())
+                return_code = await process.wait()
+                self.active_process = None
                 if job.state == "canceled":
-                    await self.terminate_process(process)
-                    break
-            if buffered_line:
-                self.publish_log_line(job, buffered_line.rstrip())
-            return_code = await process.wait()
-            self.active_process = None
-            if job.state == "canceled":
-                raise RuntimeError("Job canceled.")
-            if return_code != 0:
-                raise RuntimeError(f"{stage} exited with code {return_code}.")
+                    raise RuntimeError("Job canceled.")
+                if return_code != 0:
+                    raise RuntimeError(f"{stage} exited with code {return_code}.")
+        finally:
+            stop_preview_monitor.set()
+            try:
+                await preview_monitor
+            except asyncio.CancelledError:
+                pass
         self.update(job, stage=stage, progress=f"Finished {stage}.")
+        self.publish_preview_updates(job, reason=stage)
 
     def publish_log_text(self, job: Job, text: str) -> str:
         parts = text.splitlines(keepends=True)
@@ -840,11 +1012,11 @@ def pipeline_commands(
         (
             "trajectory generation",
             WORLDGEN_DIR,
-            ["python", "traj_generate.py", "--target_path", scene, "--split_view_num", split_views, "--trajectory_modes", modes],
+            ["python", "traj_generate.py", "--target_path", scene, "--split_view_num", split_views, "--trajectory_modes", modes, "--skip_exist"],
         ),
-        ("trajectory rendering", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "traj_render.py", "--target_path", scene]),
+        ("trajectory rendering", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "traj_render.py", "--target_path", scene, "--skip_exist"]),
         ("caption writing", ROOT_DIR, ["python", "scripts/write_traj_captions.py", "--target-path", scene, "--prompt", prompt]),
-        ("video generation", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "video_gen.py", "--target_path", scene]),
+        ("video generation", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "video_gen.py", "--target_path", scene, "--skip_exist"]),
         ("GS data generation", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "gen_gs_data.py", "--root_path", scene, "--save_normal", "--split_sky"]),
         (
             "8000-step GS training",
@@ -940,30 +1112,37 @@ async def create_job(
         selected_gs_max_steps = sanitize_gs_max_steps(gs_max_steps)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job_id = make_job_id()
-    run_dir = OUTPUT_ROOT / job_id
     data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    input_hash_value, image_sha256, input_params = task_hash(data, split_view_num, selected_modes, indoor, selected_gs_max_steps)
+    job_id = f"task_{input_hash_value[:20]}"
+    run_dir = OUTPUT_ROOT / job_id
+
+    existing = store.jobs.get(job_id)
+    if existing:
+        manager.refresh_artifacts(existing)
+        manager.publish(existing.id, {"type": "status", "job": existing.public()})
+        return existing.public()
+
     try:
         prepare_job_files(run_dir, file.filename, data, "", indoor=indoor)
+    except FileExistsError:
+        if not (run_dir / "panorama.png").exists():
+            raise HTTPException(status_code=409, detail=f"Task directory already exists but is incomplete: {job_id}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    now = utc_now()
-    job = Job(
-        id=job_id,
-        state="ready",
-        stage="uploaded",
-        progress="Panorama uploaded. Set split views and start.",
-        prompt="",
-        run_dir=str(run_dir),
-        created_at=now,
-        updated_at=now,
+    job = make_job_record(
+        job_id=job_id,
+        run_dir=run_dir,
         split_view_num=split_view_num,
         trajectory_modes=selected_modes,
         indoor=indoor,
         gs_max_steps=selected_gs_max_steps,
-        prompt_source="not_started",
-        prompt_error=None,
+        input_hash_value=input_hash_value,
+        input_image_sha256=image_sha256,
+        input_params=input_params,
     )
     manager.refresh_artifacts(job)
     manager.add_job(job)
@@ -981,8 +1160,6 @@ async def start_job(
     job = store.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    if job.state not in {"ready", "failed", "canceled"}:
-        raise HTTPException(status_code=409, detail=f"Job is {job.state}, not startable.")
     split_view_num = job.split_view_num if split_view_num is None else split_view_num
     if split_view_num < 1 or split_view_num > 8:
         raise HTTPException(status_code=400, detail="split_view_num must be between 1 and 8.")
@@ -991,7 +1168,52 @@ async def start_job(
         selected_gs_max_steps = sanitize_gs_max_steps(job.gs_max_steps if gs_max_steps is None else gs_max_steps)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    manager.start_job(job, split_view_num, selected_modes, job.indoor if indoor is None else indoor, selected_gs_max_steps)
+    selected_indoor = job.indoor if indoor is None else indoor
+
+    if job.input_hash:
+        try:
+            data = await asyncio.to_thread(uploaded_image_data, Path(job.run_dir))
+            input_hash_value, image_sha256, input_params = task_hash(data, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not compute task hash: {exc}") from exc
+        target_id = f"task_{input_hash_value[:20]}"
+        if target_id != job.id:
+            target_job = store.jobs.get(target_id)
+            if target_job is None:
+                target_run_dir = OUTPUT_ROOT / target_id
+                try:
+                    prepare_job_files(target_run_dir, None, data, job.prompt, indoor=selected_indoor)
+                except FileExistsError:
+                    if not (target_run_dir / "panorama.png").exists():
+                        raise HTTPException(status_code=409, detail=f"Task directory already exists but is incomplete: {target_id}")
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                target_job = make_job_record(
+                    job_id=target_id,
+                    run_dir=target_run_dir,
+                    split_view_num=split_view_num,
+                    trajectory_modes=selected_modes,
+                    indoor=selected_indoor,
+                    gs_max_steps=selected_gs_max_steps,
+                    input_hash_value=input_hash_value,
+                    input_image_sha256=image_sha256,
+                    input_params=input_params,
+                    prompt=job.prompt,
+                    prompt_source=job.prompt_source,
+                    prompt_error=job.prompt_error,
+                    progress="Created from the same uploaded image with updated parameters.",
+                )
+                manager.refresh_artifacts(target_job)
+                manager.add_job(target_job)
+            job = target_job
+
+    if job.state in {"queued", "running", "succeeded"}:
+        manager.refresh_artifacts(job)
+        return job.public()
+    if job.state not in {"ready", "failed", "canceled"}:
+        raise HTTPException(status_code=409, detail=f"Job is {job.state}, not startable.")
+
+    manager.start_job(job, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps)
     return job.public()
 
 

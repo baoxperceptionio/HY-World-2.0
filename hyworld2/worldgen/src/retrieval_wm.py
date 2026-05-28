@@ -1144,12 +1144,13 @@ class PanoramaMemoryBank:
         torch.cuda.empty_cache()
         if self.rank == 0:
             if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/name_map.json")):
+                wm_target_size = str(int(os.environ.get("HYWORLD_WORLDMIRROR_TARGET_SIZE", "832")))
                 wm_cmd = [
                     "torchrun", f"--nproc_per_node={self.world_size}", "-m", "worldrecon.pipeline",
                     "--input_path", f"{self.world_mirror_dir}/images",
                     "--prior_cam_path", f"{self.world_mirror_dir}/cameras.json",
                     "--strict_output_path", f"{self.world_mirror_dir}/results",
-                    "--target_size", "832",
+                    "--target_size", wm_target_size,
                     "--log_time",
                     "--no_interactive",
                     "--no_save_gs",
@@ -1162,7 +1163,9 @@ class PanoramaMemoryBank:
                     "--disable_heads", "normal", "points", "gs"
                 ]
                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
-                result = subprocess.run(wm_cmd, cwd="..")
+                wm_env = os.environ.copy()
+                wm_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+                result = subprocess.run(wm_cmd, cwd="..", env=wm_env)
 
                 if result.returncode != 0:
                     raise RuntimeError(f"World Mirror inference failed with return code {result.returncode}")

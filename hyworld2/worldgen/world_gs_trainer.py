@@ -1602,17 +1602,17 @@ class Runner:
                         import spz
                         print("Converting to SPZ...")
                         unpack_options = spz.UnpackOptions()
-                        unpack_options.to_coord = spz.CoordinateSystem.RUB
-                        # Load the PLY file
+                        # PLY exports use RDF coordinates; let SPZ perform the RDF -> RUB
+                        # conversion once when packing for Three.js/Spark viewers.
+                        unpack_options.to_coord = spz.CoordinateSystem.RDF
                         cloud = spz.load_splat_from_ply(f"{self.ply_dir}/point_cloud_{step}.ply", unpack_options)
                         if cfg.antialiased:
                             cloud.antialiased = True
-                        # Save as compressed SPZ format
 
                         pack_options = spz.PackOptions()
                         if hasattr(pack_options, "version"):
                             pack_options.version = 3
-                        pack_options.from_coord = spz.CoordinateSystem.RDF  # from RDF to RUB
+                        pack_options.from_coord = spz.CoordinateSystem.RDF
                         spz.save_spz(cloud, pack_options, f"{self.ply_dir}/point_cloud_{step}.spz")
 
                     if cfg.convert_to_spx:

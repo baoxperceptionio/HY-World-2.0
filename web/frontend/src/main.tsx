@@ -46,10 +46,12 @@ type Job = {
 };
 
 type SseEvent = {
-  type: "status" | "log" | "log_chunk";
+  type: "status" | "log" | "log_chunk" | "preview_update";
   job?: Job;
   line?: string;
   chunk?: string;
+  previews?: PreviewItem[];
+  reason?: string;
 };
 
 type ViewerMeta = {
@@ -139,6 +141,10 @@ function appendLogText(existing: string, text: string) {
   if (!text) return existing;
   const next = `${existing}${text}`;
   return next.length > MAX_LOG_CHARS ? next.slice(next.length - MAX_LOG_CHARS) : next;
+}
+
+function rdfToRubVector(values: [number, number, number]) {
+  return new THREE.Vector3(values[0], -values[1], -values[2]);
 }
 
 function useJobs() {
@@ -319,10 +325,10 @@ function SparkViewer({ jobId, url }: { jobId: string | null; url: string | null 
 
         if (meta) {
           const transformPoint = (values: [number, number, number]) =>
-            new THREE.Vector3(values[0], values[1], values[2]).sub(center).multiplyScalar(fitScale);
+            rdfToRubVector(values).sub(center).multiplyScalar(fitScale);
           const position = transformPoint(meta.position);
           const target = transformPoint(meta.target);
-          const up = new THREE.Vector3(meta.up[0], meta.up[1], meta.up[2]).normalize();
+          const up = rdfToRubVector(meta.up).normalize();
           if (
             Number.isFinite(position.lengthSq()) &&
             Number.isFinite(target.lengthSq()) &&
@@ -507,6 +513,7 @@ function App() {
   const centerColumnRef = useRef<HTMLDivElement | null>(null);
   const logsRef = useRef<HTMLPreElement | null>(null);
   const liveLogChunkSeenRef = useRef(false);
+  const selectedJobStateRef = useRef<JobState | null>(null);
   const { jobs, setJobs, refresh } = useJobs();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
@@ -541,11 +548,11 @@ function App() {
   const splatUrl = currentJob?.state === "succeeded" && currentJob.artifacts["point_cloud_7999.spz"]
     ? absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"])
     : null;
+  const spzDownloadUrl = currentJob?.state === "succeeded" ? currentJob.artifacts["point_cloud_7999.spz"] : null;
 
   const artifactLinks = useMemo(() => {
     const artifacts = currentJob?.artifacts ?? {};
     return [
-      ["SPZ", "point_cloud_7999.spz", FileArchive],
       ["PLY", "point_cloud_7999.ply", Box],
       ["Checkpoint", "ckpt_7999_rank0.pt", FileArchive],
       ["Log", "pipeline.log", FileText],
@@ -596,6 +603,7 @@ function App() {
     setActiveJob(currentJob);
     setLogs("");
     liveLogChunkSeenRef.current = false;
+    selectedJobStateRef.current = currentJob.state;
     setPreviews([]);
     refreshPreviews(currentJob.id);
 
@@ -606,8 +614,23 @@ function App() {
       }
     };
     const handleStatus = (job: Job) => {
+      selectedJobStateRef.current = job.state;
       setActiveJob(job);
       maybeRefreshPreviews(job);
+    };
+    const handlePreviewUpdate = (payload: SseEvent) => {
+      if (payload.job) {
+        selectedJobStateRef.current = payload.job.state;
+        setActiveJob(payload.job);
+        setJobs((existing) => [payload.job as Job, ...existing.filter((job) => job.id !== payload.job?.id)]);
+      }
+      if (payload.previews) {
+        setPreviews(payload.previews);
+      } else if (payload.job) {
+        refreshPreviews(payload.job.id);
+      } else {
+        refreshPreviews(currentJob.id);
+      }
     };
     const handleLogLine = (line: string) => {
       if (liveLogChunkSeenRef.current) return;
@@ -628,6 +651,9 @@ function App() {
       if (payload.type === "log_chunk" && payload.chunk !== undefined) {
         handleLogChunk(payload.chunk);
       }
+      if (payload.type === "preview_update") {
+        handlePreviewUpdate(payload);
+      }
     };
     source.addEventListener("status", (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
@@ -644,9 +670,15 @@ function App() {
       const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
       if (payload.chunk !== undefined) handleLogChunk(payload.chunk);
     });
+    source.addEventListener("preview_update", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as SseEvent;
+      handlePreviewUpdate(payload);
+    });
     const previewTimer = window.setInterval(() => {
-      if (["queued", "running"].includes(currentJob.state)) refreshPreviews(currentJob.id);
-    }, 5000);
+      if (selectedJobStateRef.current && ["queued", "running"].includes(selectedJobStateRef.current)) {
+        refreshPreviews(currentJob.id);
+      }
+    }, 3000);
     return () => {
       source.close();
       window.clearInterval(previewTimer);
@@ -861,6 +893,12 @@ function App() {
                 <Ban size={16} />
                 <span>Cancel</span>
               </button>
+            )}
+            {spzDownloadUrl && (
+              <a className="primary-button compact-button spz-download-button" href={apiUrl(spzDownloadUrl)} download>
+                <Download size={16} />
+                <span>Download SPZ</span>
+              </a>
             )}
             {artifactLinks.map(([label, key, Icon]) => (
               <a className="download-button" key={key as string} href={apiUrl(currentJob!.artifacts[key as string])} download>
