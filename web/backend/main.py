@@ -35,9 +35,10 @@ MAX_TRAJECTORY_MODES = 8
 DEFAULT_GS_MAX_STEPS = 8000
 MIN_GS_MAX_STEPS = 100
 MAX_GS_MAX_STEPS = 50000
-DEFAULT_WORLD_NAV_ATTEMPTS = 3
-MIN_WORLD_NAV_ATTEMPTS = 1
-MAX_WORLD_NAV_ATTEMPTS = 20
+DEFAULT_WORLD_NAV_WONDER_TOPK = 3
+DEFAULT_WORLD_NAV_RECON_TOPK = 5
+MIN_WORLD_NAV_TOPK = 1
+MAX_WORLD_NAV_TOPK = 20
 AUTO_PROMPT_FALLBACK = (
     "A cinematic camera trajectory through the panoramic scene, preserving the visible "
     "architecture, terrain, lighting, materials, objects, and overall visual style."
@@ -107,7 +108,8 @@ def canonical_task_params(
     indoor: bool,
     gs_max_steps: int,
     apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
-    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+    world_nav_wonder_topk: int | None = DEFAULT_WORLD_NAV_WONDER_TOPK,
+    world_nav_recon_topk: int | None = DEFAULT_WORLD_NAV_RECON_TOPK,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "split_view_num": max(1, min(int(split_view_num), 8)),
@@ -116,9 +118,17 @@ def canonical_task_params(
         "gs_max_steps": sanitize_gs_max_steps(gs_max_steps),
         "apply_nav_traj": bool(apply_nav_traj),
     }
-    selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
     if apply_nav_traj:
-        params["world_nav_attempts"] = selected_world_nav_attempts
+        params["world_nav_wonder_topk"] = sanitize_world_nav_topk(
+            world_nav_wonder_topk,
+            default=DEFAULT_WORLD_NAV_WONDER_TOPK,
+            field_name="world_nav_wonder_topk",
+        )
+        params["world_nav_recon_topk"] = sanitize_world_nav_topk(
+            world_nav_recon_topk,
+            default=DEFAULT_WORLD_NAV_RECON_TOPK,
+            field_name="world_nav_recon_topk",
+        )
     return params
 
 
@@ -129,10 +139,19 @@ def task_hash(
     indoor: bool,
     gs_max_steps: int,
     apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
-    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+    world_nav_wonder_topk: int | None = DEFAULT_WORLD_NAV_WONDER_TOPK,
+    world_nav_recon_topk: int | None = DEFAULT_WORLD_NAV_RECON_TOPK,
 ) -> tuple[str, str, dict[str, Any]]:
     image_sha256 = hashlib.sha256(data).hexdigest()
-    params = canonical_task_params(split_view_num, trajectory_modes, indoor, gs_max_steps, apply_nav_traj, world_nav_attempts)
+    params = canonical_task_params(
+        split_view_num,
+        trajectory_modes,
+        indoor,
+        gs_max_steps,
+        apply_nav_traj,
+        world_nav_wonder_topk,
+        world_nav_recon_topk,
+    )
     payload = {
         "version": 1,
         "image_sha256": image_sha256,
@@ -149,9 +168,19 @@ def make_job_id(
     indoor: bool,
     gs_max_steps: int,
     apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
-    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+    world_nav_wonder_topk: int | None = DEFAULT_WORLD_NAV_WONDER_TOPK,
+    world_nav_recon_topk: int | None = DEFAULT_WORLD_NAV_RECON_TOPK,
 ) -> str:
-    digest, _, _ = task_hash(data, split_view_num, trajectory_modes, indoor, gs_max_steps, apply_nav_traj, world_nav_attempts)
+    digest, _, _ = task_hash(
+        data,
+        split_view_num,
+        trajectory_modes,
+        indoor,
+        gs_max_steps,
+        apply_nav_traj,
+        world_nav_wonder_topk,
+        world_nav_recon_topk,
+    )
     return f"task_{digest[:20]}"
 
 
@@ -413,13 +442,13 @@ def sanitize_gs_max_steps(value: int) -> int:
     return steps
 
 
-def sanitize_world_nav_attempts(value: int | str | None) -> int:
+def sanitize_world_nav_topk(value: int | str | None, *, default: int, field_name: str) -> int:
     if value is None or value == "":
-        return DEFAULT_WORLD_NAV_ATTEMPTS
-    attempts = int(value)
-    if attempts < MIN_WORLD_NAV_ATTEMPTS or attempts > MAX_WORLD_NAV_ATTEMPTS:
-        raise ValueError(f"world_nav_attempts must be between {MIN_WORLD_NAV_ATTEMPTS} and {MAX_WORLD_NAV_ATTEMPTS}.")
-    return attempts
+        return default
+    topk = int(value)
+    if topk < MIN_WORLD_NAV_TOPK or topk > MAX_WORLD_NAV_TOPK:
+        raise ValueError(f"{field_name} must be between {MIN_WORLD_NAV_TOPK} and {MAX_WORLD_NAV_TOPK}.")
+    return topk
 
 
 def split_view_preview_specs(split_view_num: int, trajectory_modes: list[str] | None = None) -> list[tuple[str, str, str, str, list[str]]]:
@@ -692,7 +721,8 @@ class Job:
     indoor: bool = False
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS
     apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ
-    world_nav_attempts: int = DEFAULT_WORLD_NAV_ATTEMPTS
+    world_nav_wonder_topk: int = DEFAULT_WORLD_NAV_WONDER_TOPK
+    world_nav_recon_topk: int = DEFAULT_WORLD_NAV_RECON_TOPK
     prompt_source: str = "unknown"
     prompt_error: str | None = None
     input_hash: str | None = None
@@ -737,7 +767,9 @@ class JobStore:
             data.setdefault("indoor", False)
             data.setdefault("gs_max_steps", DEFAULT_GS_MAX_STEPS)
             data.setdefault("apply_nav_traj", DEFAULT_APPLY_NAV_TRAJ)
-            data.setdefault("world_nav_attempts", DEFAULT_WORLD_NAV_ATTEMPTS)
+            legacy_world_nav_attempts = data.pop("world_nav_attempts", None)
+            data.setdefault("world_nav_wonder_topk", legacy_world_nav_attempts or DEFAULT_WORLD_NAV_WONDER_TOPK)
+            data.setdefault("world_nav_recon_topk", legacy_world_nav_attempts or DEFAULT_WORLD_NAV_RECON_TOPK)
             data.setdefault("prompt_source", "unknown")
             data.setdefault("prompt_error", None)
             data.setdefault("input_hash", None)
@@ -751,9 +783,21 @@ class JobStore:
             except ValueError:
                 data["gs_max_steps"] = DEFAULT_GS_MAX_STEPS
             try:
-                data["world_nav_attempts"] = sanitize_world_nav_attempts(data["world_nav_attempts"])
+                data["world_nav_wonder_topk"] = sanitize_world_nav_topk(
+                    data["world_nav_wonder_topk"],
+                    default=DEFAULT_WORLD_NAV_WONDER_TOPK,
+                    field_name="world_nav_wonder_topk",
+                )
             except (TypeError, ValueError):
-                data["world_nav_attempts"] = DEFAULT_WORLD_NAV_ATTEMPTS
+                data["world_nav_wonder_topk"] = DEFAULT_WORLD_NAV_WONDER_TOPK
+            try:
+                data["world_nav_recon_topk"] = sanitize_world_nav_topk(
+                    data["world_nav_recon_topk"],
+                    default=DEFAULT_WORLD_NAV_RECON_TOPK,
+                    field_name="world_nav_recon_topk",
+                )
+            except (TypeError, ValueError):
+                data["world_nav_recon_topk"] = DEFAULT_WORLD_NAV_RECON_TOPK
             job = Job(**data)
             loaded_jobs[job.id] = job
         self.jobs = loaded_jobs
@@ -796,7 +840,8 @@ def make_job_record(
     indoor: bool,
     gs_max_steps: int,
     apply_nav_traj: bool,
-    world_nav_attempts: int,
+    world_nav_wonder_topk: int,
+    world_nav_recon_topk: int,
     input_hash_value: str | None,
     input_image_sha256: str | None,
     input_params: dict[str, Any] | None,
@@ -820,7 +865,8 @@ def make_job_record(
         indoor=indoor,
         gs_max_steps=gs_max_steps,
         apply_nav_traj=apply_nav_traj,
-        world_nav_attempts=world_nav_attempts,
+        world_nav_wonder_topk=world_nav_wonder_topk,
+        world_nav_recon_topk=world_nav_recon_topk,
         prompt_source=prompt_source,
         prompt_error=prompt_error,
         input_hash=input_hash_value,
@@ -868,14 +914,16 @@ class JobManager:
         indoor: bool,
         gs_max_steps: int,
         apply_nav_traj: bool,
-        world_nav_attempts: int,
+        world_nav_wonder_topk: int,
+        world_nav_recon_topk: int,
     ) -> None:
         job.split_view_num = split_view_num
         job.trajectory_modes = trajectory_modes
         job.indoor = indoor
         job.gs_max_steps = gs_max_steps
         job.apply_nav_traj = apply_nav_traj
-        job.world_nav_attempts = world_nav_attempts
+        job.world_nav_wonder_topk = world_nav_wonder_topk
+        job.world_nav_recon_topk = world_nav_recon_topk
         job.error = None
         queue_token = self.queue_tokens.get(job.id, 0) + 1
         self.queue_tokens[job.id] = queue_token
@@ -887,7 +935,8 @@ class JobManager:
             progress=(
                 f"Waiting for the GPU pipeline. split_view_num={split_view_num}, "
                 f"trajectory_modes={mode_text}, apply_nav_traj={apply_nav_traj}, "
-                f"world_nav_attempts={world_nav_attempts}, gs_max_steps={gs_max_steps}."
+                f"wonder_topk={world_nav_wonder_topk}, recon_topk={world_nav_recon_topk}, "
+                f"gs_max_steps={gs_max_steps}."
             ),
         )
         self.queue.put_nowait((job.id, queue_token))
@@ -1026,7 +1075,8 @@ class JobManager:
                 job.trajectory_modes,
                 job.gs_max_steps,
                 job.apply_nav_traj,
-                job.world_nav_attempts,
+                job.world_nav_wonder_topk,
+                job.world_nav_recon_topk,
             ):
                 if job.state == "canceled":
                     self.update(job, stage="canceled", progress="Job canceled.")
@@ -1230,7 +1280,8 @@ def pipeline_commands(
     trajectory_modes: list[str] | None = None,
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS,
     apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
-    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+    world_nav_wonder_topk: int | None = DEFAULT_WORLD_NAV_WONDER_TOPK,
+    world_nav_recon_topk: int | None = DEFAULT_WORLD_NAV_RECON_TOPK,
 ) -> list[tuple[str, Path, list[str]]]:
     scene = str(scene_dir)
     split_views = str(max(1, min(int(split_view_num), 8)))
@@ -1249,8 +1300,22 @@ def pipeline_commands(
     ]
     if apply_nav_traj:
         trajectory_command.append("--apply_nav_traj")
-        selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
-        trajectory_command.extend(["--wonder_topk", str(selected_world_nav_attempts), "--recon_topk", str(selected_world_nav_attempts)])
+        selected_world_nav_wonder_topk = sanitize_world_nav_topk(
+            world_nav_wonder_topk,
+            default=DEFAULT_WORLD_NAV_WONDER_TOPK,
+            field_name="world_nav_wonder_topk",
+        )
+        selected_world_nav_recon_topk = sanitize_world_nav_topk(
+            world_nav_recon_topk,
+            default=DEFAULT_WORLD_NAV_RECON_TOPK,
+            field_name="world_nav_recon_topk",
+        )
+        trajectory_command.extend([
+            "--wonder_topk",
+            str(selected_world_nav_wonder_topk),
+            "--recon_topk",
+            str(selected_world_nav_recon_topk),
+        ])
     return [
         (
             "trajectory generation",
@@ -1348,14 +1413,25 @@ async def create_job(
     indoor: bool = Form(False),
     gs_max_steps: int = Form(DEFAULT_GS_MAX_STEPS),
     apply_nav_traj: bool = Form(DEFAULT_APPLY_NAV_TRAJ),
-    world_nav_attempts: str | None = Form(str(DEFAULT_WORLD_NAV_ATTEMPTS)),
+    world_nav_wonder_topk: str | None = Form(str(DEFAULT_WORLD_NAV_WONDER_TOPK)),
+    world_nav_recon_topk: str | None = Form(str(DEFAULT_WORLD_NAV_RECON_TOPK)),
+    world_nav_attempts: str | None = Form(None),
 ):
     if split_view_num < 1 or split_view_num > 8:
         raise HTTPException(status_code=400, detail="split_view_num must be between 1 and 8.")
     try:
         selected_modes = sanitize_trajectory_modes(trajectory_modes)
         selected_gs_max_steps = sanitize_gs_max_steps(gs_max_steps)
-        selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
+        selected_world_nav_wonder_topk = sanitize_world_nav_topk(
+            world_nav_attempts if world_nav_attempts is not None else world_nav_wonder_topk,
+            default=DEFAULT_WORLD_NAV_WONDER_TOPK,
+            field_name="world_nav_wonder_topk",
+        )
+        selected_world_nav_recon_topk = sanitize_world_nav_topk(
+            world_nav_attempts if world_nav_attempts is not None else world_nav_recon_topk,
+            default=DEFAULT_WORLD_NAV_RECON_TOPK,
+            field_name="world_nav_recon_topk",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     data = await file.read()
@@ -1368,7 +1444,8 @@ async def create_job(
         indoor,
         selected_gs_max_steps,
         apply_nav_traj,
-        selected_world_nav_attempts,
+        selected_world_nav_wonder_topk,
+        selected_world_nav_recon_topk,
     )
     job_id = f"task_{input_hash_value[:20]}"
     run_dir = OUTPUT_ROOT / job_id
@@ -1395,7 +1472,8 @@ async def create_job(
         indoor=indoor,
         gs_max_steps=selected_gs_max_steps,
         apply_nav_traj=apply_nav_traj,
-        world_nav_attempts=selected_world_nav_attempts,
+        world_nav_wonder_topk=selected_world_nav_wonder_topk,
+        world_nav_recon_topk=selected_world_nav_recon_topk,
         input_hash_value=input_hash_value,
         input_image_sha256=image_sha256,
         input_params=input_params,
@@ -1413,6 +1491,8 @@ async def start_job(
     indoor: bool | None = None,
     gs_max_steps: int | None = None,
     apply_nav_traj: bool | None = None,
+    world_nav_wonder_topk: str | None = None,
+    world_nav_recon_topk: str | None = None,
     world_nav_attempts: str | None = None,
 ):
     job = store.jobs.get(job_id)
@@ -1424,7 +1504,16 @@ async def start_job(
     try:
         selected_modes = sanitize_trajectory_modes(job.trajectory_modes if trajectory_modes is None else trajectory_modes)
         selected_gs_max_steps = sanitize_gs_max_steps(job.gs_max_steps if gs_max_steps is None else gs_max_steps)
-        selected_world_nav_attempts = sanitize_world_nav_attempts(job.world_nav_attempts if world_nav_attempts is None else world_nav_attempts)
+        selected_world_nav_wonder_topk = sanitize_world_nav_topk(
+            world_nav_attempts if world_nav_attempts is not None else (job.world_nav_wonder_topk if world_nav_wonder_topk is None else world_nav_wonder_topk),
+            default=DEFAULT_WORLD_NAV_WONDER_TOPK,
+            field_name="world_nav_wonder_topk",
+        )
+        selected_world_nav_recon_topk = sanitize_world_nav_topk(
+            world_nav_attempts if world_nav_attempts is not None else (job.world_nav_recon_topk if world_nav_recon_topk is None else world_nav_recon_topk),
+            default=DEFAULT_WORLD_NAV_RECON_TOPK,
+            field_name="world_nav_recon_topk",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     selected_indoor = job.indoor if indoor is None else indoor
@@ -1440,7 +1529,8 @@ async def start_job(
                 selected_indoor,
                 selected_gs_max_steps,
                 selected_apply_nav_traj,
-                selected_world_nav_attempts,
+                selected_world_nav_wonder_topk,
+                selected_world_nav_recon_topk,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not compute task hash: {exc}") from exc
@@ -1464,7 +1554,8 @@ async def start_job(
                     indoor=selected_indoor,
                     gs_max_steps=selected_gs_max_steps,
                     apply_nav_traj=selected_apply_nav_traj,
-                    world_nav_attempts=selected_world_nav_attempts,
+                    world_nav_wonder_topk=selected_world_nav_wonder_topk,
+                    world_nav_recon_topk=selected_world_nav_recon_topk,
                     input_hash_value=input_hash_value,
                     input_image_sha256=image_sha256,
                     input_params=input_params,
@@ -1483,7 +1574,16 @@ async def start_job(
     if job.state not in {"ready", "failed", "canceled"}:
         raise HTTPException(status_code=409, detail=f"Job is {job.state}, not startable.")
 
-    manager.start_job(job, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps, selected_apply_nav_traj, selected_world_nav_attempts)
+    manager.start_job(
+        job,
+        split_view_num,
+        selected_modes,
+        selected_indoor,
+        selected_gs_max_steps,
+        selected_apply_nav_traj,
+        selected_world_nav_wonder_topk,
+        selected_world_nav_recon_topk,
+    )
     return job.public()
 
 

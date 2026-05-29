@@ -10,8 +10,9 @@ const DEFAULT_SPLIT_VIEW_NUM = 4;
 const DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"];
 const DEFAULT_APPLY_NAV_TRAJ = false;
 const DEFAULT_GS_MAX_STEPS = 8000;
-const DEFAULT_WORLD_NAV_ATTEMPTS = 3;
-const MAX_WORLD_NAV_ATTEMPTS = 20;
+const DEFAULT_WORLD_NAV_WONDER_TOPK = 3;
+const DEFAULT_WORLD_NAV_RECON_TOPK = 5;
+const MAX_WORLD_NAV_TOPK = 20;
 const MAX_LOG_CHARS = 1_000_000;
 const SETTINGS_STORAGE_KEY = "hyworld2.pipelineSettings";
 const STARTABLE_JOB_STATES = new Set<JobState>(["ready", "failed", "canceled"]);
@@ -46,7 +47,8 @@ type Job = {
   indoor: boolean;
   gs_max_steps: number;
   apply_nav_traj: boolean;
-  world_nav_attempts?: number | null;
+  world_nav_wonder_topk?: number | null;
+  world_nav_recon_topk?: number | null;
   artifacts: Record<string, string>;
 };
 
@@ -60,6 +62,7 @@ type SseEvent = {
 };
 
 type ViewerMeta = {
+  camera_key?: string;
   position: [number, number, number];
   target: [number, number, number];
   up: [number, number, number];
@@ -87,7 +90,8 @@ type PipelineSettings = {
   indoor: boolean;
   gsMaxSteps: number;
   applyNavTraj: boolean;
-  worldNavAttempts: number;
+  worldNavWonderTopk: number;
+  worldNavReconTopk: number;
 };
 
 function apiUrl(path: string) {
@@ -98,6 +102,12 @@ function absoluteArtifactUrl(path: string) {
   if (path.startsWith("http")) return path;
   if (API_BASE.startsWith("http")) return `${API_BASE}${path}`;
   return `${window.location.origin}${API_BASE}${path}`;
+}
+
+function withCacheBuster(url: string, value: string) {
+  const parsed = new URL(url, window.location.origin);
+  parsed.searchParams.set("v", value);
+  return parsed.toString();
 }
 
 function clampInteger(value: number, fallback: number, min: number, max: number) {
@@ -119,7 +129,8 @@ function defaultPipelineSettings(): PipelineSettings {
     indoor: false,
     gsMaxSteps: DEFAULT_GS_MAX_STEPS,
     applyNavTraj: DEFAULT_APPLY_NAV_TRAJ,
-    worldNavAttempts: DEFAULT_WORLD_NAV_ATTEMPTS,
+    worldNavWonderTopk: DEFAULT_WORLD_NAV_WONDER_TOPK,
+    worldNavReconTopk: DEFAULT_WORLD_NAV_RECON_TOPK,
   };
 }
 
@@ -143,7 +154,18 @@ function normalizePipelineSettings(value: Partial<PipelineSettings> = {}): Pipel
     indoor: value.indoor ?? defaults.indoor,
     gsMaxSteps: clampInteger(value.gsMaxSteps ?? defaults.gsMaxSteps, defaults.gsMaxSteps, 100, 50000),
     applyNavTraj: value.applyNavTraj ?? defaults.applyNavTraj,
-    worldNavAttempts: normalizeRequiredInteger(value.worldNavAttempts, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS),
+    worldNavWonderTopk: normalizeRequiredInteger(
+      value.worldNavWonderTopk ?? (value as Partial<PipelineSettings> & { worldNavAttempts?: number }).worldNavAttempts,
+      DEFAULT_WORLD_NAV_WONDER_TOPK,
+      1,
+      MAX_WORLD_NAV_TOPK,
+    ),
+    worldNavReconTopk: normalizeRequiredInteger(
+      value.worldNavReconTopk ?? (value as Partial<PipelineSettings> & { worldNavAttempts?: number }).worldNavAttempts,
+      DEFAULT_WORLD_NAV_RECON_TOPK,
+      1,
+      MAX_WORLD_NAV_TOPK,
+    ),
   };
 }
 
@@ -165,6 +187,39 @@ function appendLogText(existing: string, text: string) {
 
 function rdfToRubVector(values: [number, number, number]) {
   return new THREE.Vector3(values[0], -values[1], -values[2]);
+}
+
+function vectorFromTuple(values: [number, number, number]) {
+  return new THREE.Vector3(values[0], values[1], values[2]);
+}
+
+function createPlaycanvasMetaTransform(meta: ViewerMeta) {
+  const up = vectorFromTuple(meta.up).normalize();
+  const facing = vectorFromTuple(meta.target);
+  if (meta.camera_key !== "official-preview") {
+    facing.sub(vectorFromTuple(meta.position));
+  }
+  facing.addScaledVector(up, -facing.dot(up)).normalize();
+  const right = new THREE.Vector3().crossVectors(facing, up).normalize();
+  if (
+    !Number.isFinite(up.lengthSq()) ||
+    !Number.isFinite(facing.lengthSq()) ||
+    !Number.isFinite(right.lengthSq()) ||
+    up.lengthSq() === 0 ||
+    facing.lengthSq() === 0 ||
+    right.lengthSq() === 0
+  ) {
+    return null;
+  }
+
+  return (values: [number, number, number]) => {
+    const vector = vectorFromTuple(values);
+    return new THREE.Vector3(vector.dot(right), -vector.dot(up), vector.dot(facing));
+  };
+}
+
+function normalizeFiniteVector(vector: THREE.Vector3) {
+  return Number.isFinite(vector.lengthSq()) && vector.lengthSq() > 0 ? vector.normalize() : null;
 }
 
 function useJobs() {
@@ -208,6 +263,7 @@ function SparkViewer({ jobId, url }: { jobId: string | null; url: string | null 
     scene.background = new THREE.Color(0x0b0f14);
 
     const camera = new THREE.PerspectiveCamera(62, 1, 0.01, 2000);
+    camera.up.set(0, -1, 0);
     camera.position.set(0, 0.25, 3.3);
     camera.lookAt(0, 0, 0);
 
@@ -344,23 +400,30 @@ function SparkViewer({ jobId, url }: { jobId: string | null; url: string | null 
         mesh.position.copy(center).multiplyScalar(-fitScale);
 
         if (meta) {
+          const metaToSpzVector = createPlaycanvasMetaTransform(meta);
           const transformPoint = (values: [number, number, number]) =>
-            rdfToRubVector(values).sub(center).multiplyScalar(fitScale);
+            (metaToSpzVector?.(values) ?? rdfToRubVector(values)).sub(center).multiplyScalar(fitScale);
+          const transformDirection = (values: [number, number, number]) =>
+            metaToSpzVector?.(values) ?? rdfToRubVector(values);
           const position = transformPoint(meta.position);
-          const target = transformPoint(meta.target);
-          const up = rdfToRubVector(meta.up).normalize();
+          const viewDirection =
+            meta.camera_key === "official-preview"
+              ? normalizeFiniteVector(transformDirection(meta.target))
+              : normalizeFiniteVector(transformPoint(meta.target).sub(position));
+          const up = (metaToSpzVector?.(meta.up) ?? rdfToRubVector(meta.up)).normalize();
+          const target = viewDirection ? position.clone().add(viewDirection) : new THREE.Vector3();
           if (
             Number.isFinite(position.lengthSq()) &&
             Number.isFinite(target.lengthSq()) &&
             Number.isFinite(up.lengthSq()) &&
             up.lengthSq() > 0 &&
-            position.distanceToSquared(target) > 1e-8
+            viewDirection
           ) {
             camera.fov = THREE.MathUtils.clamp(meta.fov || 62, 35, 95);
             camera.up.copy(up);
             camera.position.copy(position);
             lookAtPoint.copy(target);
-            lookDistance.value = Math.max(position.distanceTo(target), 0.25);
+            lookDistance.value = 1;
             setCameraLook();
           } else {
             lookAtPoint.set(0, 0, 0);
@@ -368,6 +431,7 @@ function SparkViewer({ jobId, url }: { jobId: string | null; url: string | null 
             setCameraLook();
           }
         } else {
+          camera.up.set(0, -1, 0);
           camera.position.set(0, 0.25, 3.3);
           lookAtPoint.set(0, 0, 0);
           lookDistance.value = Math.max(camera.position.distanceTo(lookAtPoint), 0.25);
@@ -607,7 +671,7 @@ function App() {
   const [previews, setPreviews] = useState<PreviewItem[]>([]);
   const [pipelineSettings, setPipelineSettings] = useState<PipelineSettings>(() => loadPipelineSettings());
   const [previewHeight, setPreviewHeight] = useState(330);
-  const { splitViewNum, trajectoryModes, indoor, gsMaxSteps, applyNavTraj, worldNavAttempts } = pipelineSettings;
+  const { splitViewNum, trajectoryModes, indoor, gsMaxSteps, applyNavTraj, worldNavWonderTopk, worldNavReconTopk } = pipelineSettings;
 
   const currentJob = activeJob ?? jobs.find((job) => job.id === selectedId) ?? jobs[0] ?? null;
   const llmDescription = currentJob?.prompt?.trim() ?? "";
@@ -628,9 +692,11 @@ function App() {
           ? `${promptError || "LLM did not produce a scene-specific description."} The pipeline is using a generic fallback prompt.`
           : "Upload an image, then click Start to generate the scene description.";
   const splatUrl = currentJob?.state === "succeeded" && currentJob.artifacts["point_cloud_7999.spz"]
-    ? absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"])
+    ? withCacheBuster(absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"]), currentJob.updated_at)
     : null;
-  const spzDownloadUrl = currentJob?.state === "succeeded" ? currentJob.artifacts["point_cloud_7999.spz"] : null;
+  const spzDownloadUrl = currentJob?.state === "succeeded" && currentJob.artifacts["point_cloud_7999.spz"]
+    ? withCacheBuster(absoluteArtifactUrl(currentJob.artifacts["point_cloud_7999.spz"]), currentJob.updated_at)
+    : null;
 
   const artifactLinks = useMemo(() => {
     const artifacts = currentJob?.artifacts ?? {};
@@ -780,7 +846,8 @@ function App() {
     formData.append("indoor", String(indoor));
     formData.append("gs_max_steps", String(clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000)));
     formData.append("apply_nav_traj", String(applyNavTraj));
-    formData.append("world_nav_attempts", String(worldNavAttempts));
+    formData.append("world_nav_wonder_topk", String(worldNavWonderTopk));
+    formData.append("world_nav_recon_topk", String(worldNavReconTopk));
     const response = await fetch(apiUrl("/api/jobs"), { method: "POST", body: formData });
     setUploading(false);
     if (!response.ok) {
@@ -804,13 +871,15 @@ function App() {
     const safeSplitViewNum = clampInteger(splitViewNum, DEFAULT_SPLIT_VIEW_NUM, 1, 8);
     const safeTrajectoryModes = normalizeTrajectoryModes(trajectoryModes);
     const safeGsMaxSteps = clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000);
-    const safeWorldNavAttempts = normalizeRequiredInteger(worldNavAttempts, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS);
+    const safeWorldNavWonderTopk = normalizeRequiredInteger(worldNavWonderTopk, DEFAULT_WORLD_NAV_WONDER_TOPK, 1, MAX_WORLD_NAV_TOPK);
+    const safeWorldNavReconTopk = normalizeRequiredInteger(worldNavReconTopk, DEFAULT_WORLD_NAV_RECON_TOPK, 1, MAX_WORLD_NAV_TOPK);
     updatePipelineSettings({
       splitViewNum: safeSplitViewNum,
       trajectoryModes: safeTrajectoryModes,
       gsMaxSteps: safeGsMaxSteps,
       applyNavTraj,
-      worldNavAttempts: safeWorldNavAttempts,
+      worldNavWonderTopk: safeWorldNavWonderTopk,
+      worldNavReconTopk: safeWorldNavReconTopk,
     });
     const params = new URLSearchParams({
       split_view_num: String(safeSplitViewNum),
@@ -818,7 +887,8 @@ function App() {
       indoor: String(indoor),
       gs_max_steps: String(safeGsMaxSteps),
       apply_nav_traj: String(applyNavTraj),
-      world_nav_attempts: String(safeWorldNavAttempts),
+      world_nav_wonder_topk: String(safeWorldNavWonderTopk),
+      world_nav_recon_topk: String(safeWorldNavReconTopk),
     });
     const response = await fetch(apiUrl(`/api/jobs/${currentJob.id}/start?${params.toString()}`), { method: "POST" });
     if (!response.ok) {
@@ -930,16 +1000,30 @@ function App() {
             <span>NavMesh navigation</span>
           </label>
           <label className="field compact-field">
-            <span>WorldNav attempts</span>
+            <span>Wonder top-k</span>
             <input
               type="number"
               min={1}
-              max={MAX_WORLD_NAV_ATTEMPTS}
+              max={MAX_WORLD_NAV_TOPK}
               step={1}
-              value={worldNavAttempts}
+              value={worldNavWonderTopk}
               disabled={!applyNavTraj}
               onChange={(event) => updatePipelineSettings({
-                worldNavAttempts: normalizeRequiredInteger(event.target.value, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS),
+                worldNavWonderTopk: normalizeRequiredInteger(event.target.value, DEFAULT_WORLD_NAV_WONDER_TOPK, 1, MAX_WORLD_NAV_TOPK),
+              })}
+            />
+          </label>
+          <label className="field compact-field">
+            <span>Recon top-k</span>
+            <input
+              type="number"
+              min={1}
+              max={MAX_WORLD_NAV_TOPK}
+              step={1}
+              value={worldNavReconTopk}
+              disabled={!applyNavTraj}
+              onChange={(event) => updatePipelineSettings({
+                worldNavReconTopk: normalizeRequiredInteger(event.target.value, DEFAULT_WORLD_NAV_RECON_TOPK, 1, MAX_WORLD_NAV_TOPK),
               })}
             />
           </label>
@@ -1001,7 +1085,7 @@ function App() {
               </button>
             )}
             {spzDownloadUrl && (
-              <a className="primary-button compact-button spz-download-button" href={apiUrl(spzDownloadUrl)} download>
+              <a className="primary-button compact-button spz-download-button" href={spzDownloadUrl} download>
                 <Download size={16} />
                 <span>Download SPZ</span>
               </a>

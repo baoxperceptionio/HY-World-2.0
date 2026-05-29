@@ -1706,17 +1706,17 @@ class Runner:
                         import spz
                         print("Converting to SPZ...")
                         unpack_options = spz.UnpackOptions()
-                        # PLY exports use RDF coordinates; let SPZ perform the RDF -> RUB
-                        # conversion once when packing for Three.js/Spark viewers.
-                        unpack_options.to_coord = spz.CoordinateSystem.RDF
-                        cloud = spz.load_splat_from_ply(f"{self.ply_dir}/point_cloud_{step}.ply", unpack_options)
+                        # The PlayCanvas PLY is already exported in the viewer coordinate
+                        # system, so keep coordinates untouched while packing SPZ.
+                        unpack_options.to_coord = spz.CoordinateSystem.UNSPECIFIED
+                        cloud = spz.load_splat_from_ply(playcanvas_ply_path, unpack_options)
                         if cfg.antialiased:
                             cloud.antialiased = True
 
                         pack_options = spz.PackOptions()
                         if hasattr(pack_options, "version"):
                             pack_options.version = 3
-                        pack_options.from_coord = spz.CoordinateSystem.RDF
+                        pack_options.from_coord = spz.CoordinateSystem.UNSPECIFIED
                         spz.save_spz(cloud, pack_options, f"{self.ply_dir}/point_cloud_{step}.spz")
 
                     if cfg.convert_to_spx:
