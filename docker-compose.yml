@@ -36,7 +36,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
       PYTHONPATH: /workspace/HY-World-2.0:/workspace/HY-World-2.0/hyworld2:/workspace/HY-World-2.0/hyworld2/worldgen:/workspace/HY-World-2.0/hyworld2/panogen
       HYWORLD_ROOT: /workspace/HY-World-2.0
-      HYWORLD_DISABLE_SAM3: ${HYWORLD_DISABLE_SAM3:-1}
+      HYWORLD_DISABLE_SAM3: "0"
       HYWORLD_CMD: ${HYWORLD_CMD:-}
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-8}
@@ -88,7 +88,7 @@ services:
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-8}
       HYWORLD_ROOT: /workspace/HY-World-2.0
-      HYWORLD_DISABLE_SAM3: ${HYWORLD_DISABLE_SAM3:-1}
+      HYWORLD_DISABLE_SAM3: "0"
     volumes:
       - .:/workspace/HY-World-2.0
       - ${HF_HOME_HOST:-/home/ubuntu/.cache/huggingface}:/workspace/.cache/huggingface

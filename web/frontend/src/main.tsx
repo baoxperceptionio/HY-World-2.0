@@ -1,6 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, Ban, Box, CheckCircle2, Download, FileArchive, FileText, ImageUp, Loader2, Play, RotateCcw, UploadCloud, XCircle } from "lucide-react";
+import { Activity, Ban, Box, CheckCircle2, Download, FileArchive, FileText, ImageUp, Loader2, Play, RotateCcw, UploadCloud, X, XCircle } from "lucide-react";
 import * as THREE from "three";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import "./styles.css";
@@ -8,7 +8,10 @@ import "./styles.css";
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const DEFAULT_SPLIT_VIEW_NUM = 4;
 const DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"];
+const DEFAULT_APPLY_NAV_TRAJ = false;
 const DEFAULT_GS_MAX_STEPS = 8000;
+const DEFAULT_WORLD_NAV_ATTEMPTS = 3;
+const MAX_WORLD_NAV_ATTEMPTS = 20;
 const MAX_LOG_CHARS = 1_000_000;
 const SETTINGS_STORAGE_KEY = "hyworld2.pipelineSettings";
 const STARTABLE_JOB_STATES = new Set<JobState>(["ready", "failed", "canceled"]);
@@ -42,6 +45,8 @@ type Job = {
   trajectory_modes: string[];
   indoor: boolean;
   gs_max_steps: number;
+  apply_nav_traj: boolean;
+  world_nav_attempts?: number | null;
   artifacts: Record<string, string>;
 };
 
@@ -72,6 +77,8 @@ type PreviewItem = {
   path: string | null;
   url: string | null;
   updated_at: string | null;
+  group_title?: string | null;
+  group_order?: number | null;
 };
 
 type PipelineSettings = {
@@ -79,6 +86,8 @@ type PipelineSettings = {
   trajectoryModes: string[];
   indoor: boolean;
   gsMaxSteps: number;
+  applyNavTraj: boolean;
+  worldNavAttempts: number;
 };
 
 function apiUrl(path: string) {
@@ -96,12 +105,21 @@ function clampInteger(value: number, fallback: number, min: number, max: number)
   return Math.max(min, Math.min(max, rounded || fallback));
 }
 
+function normalizeRequiredInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return clampInteger(numeric, fallback, min, max);
+}
+
 function defaultPipelineSettings(): PipelineSettings {
   return {
     splitViewNum: DEFAULT_SPLIT_VIEW_NUM,
     trajectoryModes: DEFAULT_TRAJECTORY_MODES,
     indoor: false,
     gsMaxSteps: DEFAULT_GS_MAX_STEPS,
+    applyNavTraj: DEFAULT_APPLY_NAV_TRAJ,
+    worldNavAttempts: DEFAULT_WORLD_NAV_ATTEMPTS,
   };
 }
 
@@ -124,6 +142,8 @@ function normalizePipelineSettings(value: Partial<PipelineSettings> = {}): Pipel
     trajectoryModes: normalizeTrajectoryModes(value.trajectoryModes ?? defaults.trajectoryModes),
     indoor: value.indoor ?? defaults.indoor,
     gsMaxSteps: clampInteger(value.gsMaxSteps ?? defaults.gsMaxSteps, defaults.gsMaxSteps, 100, 50000),
+    applyNavTraj: value.applyNavTraj ?? defaults.applyNavTraj,
+    worldNavAttempts: normalizeRequiredInteger(value.worldNavAttempts, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS),
   };
 }
 
@@ -438,14 +458,63 @@ function previewViewIndex(item: PreviewItem) {
   return match ? Number(match[1]) : null;
 }
 
-function PreviewCard({ item }: { item: PreviewItem }) {
+function previewCustomRows(items: PreviewItem[]) {
+  return Array.from(
+    items.reduce((groups, item) => {
+      if (!item.group_title) return groups;
+      const existing = groups.get(item.group_title) ?? { items: [] as PreviewItem[], order: item.group_order ?? Number.MAX_SAFE_INTEGER };
+      existing.items.push(item);
+      existing.order = Math.min(existing.order, item.group_order ?? Number.MAX_SAFE_INTEGER);
+      groups.set(item.group_title, existing);
+      return groups;
+    }, new Map<string, { items: PreviewItem[]; order: number }>())
+  ).sort(([titleA, rowA], [titleB, rowB]) => rowA.order - rowB.order || titleA.localeCompare(titleB));
+}
+
+function PreviewImageLightbox({ item, onClose }: { item: PreviewItem; onClose: () => void }) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  if (!item.url) return null;
+
+  return (
+    <div className="image-lightbox" role="dialog" aria-modal="true" aria-label={item.title} onClick={onClose}>
+      <div className="image-lightbox-content" onClick={(event) => event.stopPropagation()}>
+        <div className="image-lightbox-header">
+          <div>
+            <strong>{item.title}</strong>
+            <span>{item.stage}</span>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close image preview" title="Close">
+            <X size={17} />
+          </button>
+        </div>
+        <div className="image-lightbox-frame">
+          <img src={apiUrl(item.url)} alt={item.title} />
+        </div>
+        <small>{item.path}</small>
+      </div>
+    </div>
+  );
+}
+
+function PreviewCard({ item, onImageOpen }: { item: PreviewItem; onImageOpen: (item: PreviewItem) => void }) {
   return (
     <article className={`preview-card ${item.available ? "available" : "pending"}`}>
       <div className="preview-media">
         {item.available && item.url && item.kind === "video" && (
           <video src={apiUrl(item.url)} controls muted loop playsInline preload="metadata" />
         )}
-        {item.available && item.url && item.kind === "image" && <img src={apiUrl(item.url)} alt={item.title} loading="lazy" />}
+        {item.available && item.url && item.kind === "image" && (
+          <button className="preview-image-button" type="button" onClick={() => onImageOpen(item)} aria-label={`Open ${item.title}`}>
+            <img src={apiUrl(item.url)} alt={item.title} loading="lazy" />
+          </button>
+        )}
         {!item.available && <FileArchive size={26} />}
       </div>
       <div className="preview-meta">
@@ -461,8 +530,9 @@ function PreviewCard({ item }: { item: PreviewItem }) {
 }
 
 function PreviewPanel({ items }: { items: PreviewItem[] }) {
+  const [expandedImage, setExpandedImage] = useState<PreviewItem | null>(null);
   const availableItems = items.filter((item) => item.available && item.url);
-  const overviewItems = items.filter((item) => previewViewIndex(item) === null);
+  const overviewItems = items.filter((item) => previewViewIndex(item) === null && !item.group_title);
   const viewGroups = Array.from(
     items.reduce((groups, item) => {
       const viewIndex = previewViewIndex(item);
@@ -473,6 +543,7 @@ function PreviewPanel({ items }: { items: PreviewItem[] }) {
       return groups;
     }, new Map<number, PreviewItem[]>())
   ).sort(([a], [b]) => a - b);
+  const customRows = previewCustomRows(items);
 
   return (
     <section className="preview-panel" aria-label="Pipeline previews">
@@ -489,22 +560,34 @@ function PreviewPanel({ items }: { items: PreviewItem[] }) {
               <span>{overviewItems.filter((item) => item.available).length}/{overviewItems.length}</span>
             </div>
             <div className="preview-strip">
-              {overviewItems.map((item) => <PreviewCard key={item.id} item={item} />)}
+              {overviewItems.map((item) => <PreviewCard key={item.id} item={item} onImageOpen={setExpandedImage} />)}
             </div>
           </div>
         )}
         {viewGroups.map(([viewIndex, groupItems]) => (
           <div className="preview-row" key={viewIndex}>
             <div className="preview-row-heading">
-              <h3>View {viewIndex}</h3>
+              <h3 title={`View ${viewIndex}`}>View {viewIndex}</h3>
               <span>{groupItems.filter((item) => item.available).length}/{groupItems.length}</span>
             </div>
             <div className="preview-strip">
-              {groupItems.map((item) => <PreviewCard key={item.id} item={item} />)}
+              {groupItems.map((item) => <PreviewCard key={item.id} item={item} onImageOpen={setExpandedImage} />)}
+            </div>
+          </div>
+        ))}
+        {customRows.map(([title, row]) => (
+          <div className="preview-row" key={title}>
+            <div className="preview-row-heading">
+              <h3 title={title}>{title}</h3>
+              <span>{row.items.filter((item) => item.available).length}/{row.items.length}</span>
+            </div>
+            <div className="preview-strip">
+              {row.items.map((item) => <PreviewCard key={item.id} item={item} onImageOpen={setExpandedImage} />)}
             </div>
           </div>
         ))}
       </div>
+      {expandedImage && <PreviewImageLightbox item={expandedImage} onClose={() => setExpandedImage(null)} />}
     </section>
   );
 }
@@ -524,7 +607,7 @@ function App() {
   const [previews, setPreviews] = useState<PreviewItem[]>([]);
   const [pipelineSettings, setPipelineSettings] = useState<PipelineSettings>(() => loadPipelineSettings());
   const [previewHeight, setPreviewHeight] = useState(330);
-  const { splitViewNum, trajectoryModes, indoor, gsMaxSteps } = pipelineSettings;
+  const { splitViewNum, trajectoryModes, indoor, gsMaxSteps, applyNavTraj, worldNavAttempts } = pipelineSettings;
 
   const currentJob = activeJob ?? jobs.find((job) => job.id === selectedId) ?? jobs[0] ?? null;
   const llmDescription = currentJob?.prompt?.trim() ?? "";
@@ -552,6 +635,7 @@ function App() {
   const artifactLinks = useMemo(() => {
     const artifacts = currentJob?.artifacts ?? {};
     return [
+      ["PlayCanvas PLY", "point_cloud_7999_playcanvas.ply", Box],
       ["PLY", "point_cloud_7999.ply", Box],
       ["Checkpoint", "ckpt_7999_rank0.pt", FileArchive],
       ["Log", "pipeline.log", FileText],
@@ -695,6 +779,8 @@ function App() {
     formData.append("trajectory_modes", normalizeTrajectoryModes(trajectoryModes).join(","));
     formData.append("indoor", String(indoor));
     formData.append("gs_max_steps", String(clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000)));
+    formData.append("apply_nav_traj", String(applyNavTraj));
+    formData.append("world_nav_attempts", String(worldNavAttempts));
     const response = await fetch(apiUrl("/api/jobs"), { method: "POST", body: formData });
     setUploading(false);
     if (!response.ok) {
@@ -718,16 +804,21 @@ function App() {
     const safeSplitViewNum = clampInteger(splitViewNum, DEFAULT_SPLIT_VIEW_NUM, 1, 8);
     const safeTrajectoryModes = normalizeTrajectoryModes(trajectoryModes);
     const safeGsMaxSteps = clampInteger(gsMaxSteps, DEFAULT_GS_MAX_STEPS, 100, 50000);
+    const safeWorldNavAttempts = normalizeRequiredInteger(worldNavAttempts, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS);
     updatePipelineSettings({
       splitViewNum: safeSplitViewNum,
       trajectoryModes: safeTrajectoryModes,
       gsMaxSteps: safeGsMaxSteps,
+      applyNavTraj,
+      worldNavAttempts: safeWorldNavAttempts,
     });
     const params = new URLSearchParams({
       split_view_num: String(safeSplitViewNum),
       trajectory_modes: safeTrajectoryModes.join(","),
       indoor: String(indoor),
       gs_max_steps: String(safeGsMaxSteps),
+      apply_nav_traj: String(applyNavTraj),
+      world_nav_attempts: String(safeWorldNavAttempts),
     });
     const response = await fetch(apiUrl(`/api/jobs/${currentJob.id}/start?${params.toString()}`), { method: "POST" });
     if (!response.ok) {
@@ -829,6 +920,28 @@ function App() {
           <label className="checkbox-field">
             <input type="checkbox" checked={indoor} onChange={(event) => updatePipelineSettings({ indoor: event.target.checked })} />
             <span>Indoor</span>
+          </label>
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={applyNavTraj}
+              onChange={(event) => updatePipelineSettings({ applyNavTraj: event.target.checked })}
+            />
+            <span>NavMesh navigation</span>
+          </label>
+          <label className="field compact-field">
+            <span>WorldNav attempts</span>
+            <input
+              type="number"
+              min={1}
+              max={MAX_WORLD_NAV_ATTEMPTS}
+              step={1}
+              value={worldNavAttempts}
+              disabled={!applyNavTraj}
+              onChange={(event) => updatePipelineSettings({
+                worldNavAttempts: normalizeRequiredInteger(event.target.value, DEFAULT_WORLD_NAV_ATTEMPTS, 1, MAX_WORLD_NAV_ATTEMPTS),
+              })}
+            />
           </label>
           <label className="field compact-field">
             <span>GS steps</span>

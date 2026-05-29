@@ -30,10 +30,14 @@ JOBS_LOG = OUTPUT_ROOT / "jobs.jsonl"
 TARGET_SIZE = (1920, 960)
 DEFAULT_SPLIT_VIEW_NUM = 4
 DEFAULT_TRAJECTORY_MODES = ["forward", "left-translation", "right-translation"]
+DEFAULT_APPLY_NAV_TRAJ = False
 MAX_TRAJECTORY_MODES = 8
 DEFAULT_GS_MAX_STEPS = 8000
 MIN_GS_MAX_STEPS = 100
 MAX_GS_MAX_STEPS = 50000
+DEFAULT_WORLD_NAV_ATTEMPTS = 3
+MIN_WORLD_NAV_ATTEMPTS = 1
+MAX_WORLD_NAV_ATTEMPTS = 20
 AUTO_PROMPT_FALLBACK = (
     "A cinematic camera trajectory through the panoramic scene, preserving the visible "
     "architecture, terrain, lighting, materials, objects, and overall visual style."
@@ -67,6 +71,7 @@ ARTIFACTS = {
     "panorama.png": ("panorama.png", "image/png"),
     "point_cloud_7999.spz": ("gs_result/ply/point_cloud_7999.spz", "application/octet-stream"),
     "point_cloud_7999.ply": ("gs_result/ply/point_cloud_7999.ply", "application/octet-stream"),
+    "point_cloud_7999_playcanvas.ply": ("gs_result/ply/point_cloud_7999_playcanvas.ply", "application/octet-stream"),
     "ckpt_7999_rank0.pt": ("gs_result/ckpts/ckpt_7999_rank0.pt", "application/octet-stream"),
     "pipeline.log": ("pipeline.log", "text/plain"),
     "logs": ("pipeline.log", "text/plain"),
@@ -96,18 +101,38 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def canonical_task_params(split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> dict[str, Any]:
-    return {
+def canonical_task_params(
+    split_view_num: int,
+    trajectory_modes: list[str],
+    indoor: bool,
+    gs_max_steps: int,
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
+    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
         "split_view_num": max(1, min(int(split_view_num), 8)),
         "trajectory_modes": sanitize_trajectory_modes(trajectory_modes),
         "indoor": bool(indoor),
         "gs_max_steps": sanitize_gs_max_steps(gs_max_steps),
+        "apply_nav_traj": bool(apply_nav_traj),
     }
+    selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
+    if apply_nav_traj:
+        params["world_nav_attempts"] = selected_world_nav_attempts
+    return params
 
 
-def task_hash(data: bytes, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> tuple[str, str, dict[str, Any]]:
+def task_hash(
+    data: bytes,
+    split_view_num: int,
+    trajectory_modes: list[str],
+    indoor: bool,
+    gs_max_steps: int,
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
+    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+) -> tuple[str, str, dict[str, Any]]:
     image_sha256 = hashlib.sha256(data).hexdigest()
-    params = canonical_task_params(split_view_num, trajectory_modes, indoor, gs_max_steps)
+    params = canonical_task_params(split_view_num, trajectory_modes, indoor, gs_max_steps, apply_nav_traj, world_nav_attempts)
     payload = {
         "version": 1,
         "image_sha256": image_sha256,
@@ -117,8 +142,16 @@ def task_hash(data: bytes, split_view_num: int, trajectory_modes: list[str], ind
     return digest, image_sha256, params
 
 
-def make_job_id(data: bytes, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> str:
-    digest, _, _ = task_hash(data, split_view_num, trajectory_modes, indoor, gs_max_steps)
+def make_job_id(
+    data: bytes,
+    split_view_num: int,
+    trajectory_modes: list[str],
+    indoor: bool,
+    gs_max_steps: int,
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
+    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
+) -> str:
+    digest, _, _ = task_hash(data, split_view_num, trajectory_modes, indoor, gs_max_steps, apply_nav_traj, world_nav_attempts)
     return f"task_{digest[:20]}"
 
 
@@ -296,6 +329,8 @@ def artifact_path(run_dir: Path, name: str, gs_max_steps: int = DEFAULT_GS_MAX_S
         rel_path = f"gs_result/ply/point_cloud_{final_step}.spz"
     elif name == "point_cloud_7999.ply":
         rel_path = f"gs_result/ply/point_cloud_{final_step}.ply"
+    elif name == "point_cloud_7999_playcanvas.ply":
+        rel_path = f"gs_result/ply/point_cloud_{final_step}_playcanvas.ply"
     elif name == "ckpt_7999_rank0.pt":
         rel_path = f"gs_result/ckpts/ckpt_{final_step}_rank0.pt"
     return run_dir / rel_path, media_type
@@ -309,7 +344,17 @@ def safe_run_file(run_dir: Path, rel_path: str) -> Path:
     return candidate
 
 
-def make_preview_item(job_id: str, run_dir: Path, item_id: str, stage: str, title: str, description: str, candidates: list[str]) -> dict[str, Any]:
+def make_preview_item(
+    job_id: str,
+    run_dir: Path,
+    item_id: str,
+    stage: str,
+    title: str,
+    description: str,
+    candidates: list[str],
+    group_title: str | None = None,
+    group_order: int | None = None,
+) -> dict[str, Any]:
     selected: Path | None = None
     selected_rel: str | None = None
     for rel_path in candidates:
@@ -332,6 +377,8 @@ def make_preview_item(job_id: str, run_dir: Path, item_id: str, stage: str, titl
         "path": selected_rel,
         "url": None,
         "updated_at": None,
+        "group_title": group_title,
+        "group_order": group_order,
     }
     if selected and selected_rel:
         stat = selected.stat()
@@ -364,6 +411,15 @@ def sanitize_gs_max_steps(value: int) -> int:
     if steps < MIN_GS_MAX_STEPS or steps > MAX_GS_MAX_STEPS:
         raise ValueError(f"gs_max_steps must be between {MIN_GS_MAX_STEPS} and {MAX_GS_MAX_STEPS}.")
     return steps
+
+
+def sanitize_world_nav_attempts(value: int | str | None) -> int:
+    if value is None or value == "":
+        return DEFAULT_WORLD_NAV_ATTEMPTS
+    attempts = int(value)
+    if attempts < MIN_WORLD_NAV_ATTEMPTS or attempts > MAX_WORLD_NAV_ATTEMPTS:
+        raise ValueError(f"world_nav_attempts must be between {MIN_WORLD_NAV_ATTEMPTS} and {MAX_WORLD_NAV_ATTEMPTS}.")
+    return attempts
 
 
 def split_view_preview_specs(split_view_num: int, trajectory_modes: list[str] | None = None) -> list[tuple[str, str, str, str, list[str]]]:
@@ -420,6 +476,107 @@ def split_view_preview_specs(split_view_num: int, trajectory_modes: list[str] | 
     return specs
 
 
+def _world_nav_sort_key(traj_dir: Path) -> tuple[int, str, int]:
+    parent = traj_dir.parent.name
+    family_order = 99
+    for index, prefix in enumerate(("target", "wonder", "reconstruct")):
+        if parent.startswith(prefix):
+            family_order = index
+            break
+    try:
+        traj_index = int(traj_dir.name.replace("traj", "", 1))
+    except ValueError:
+        traj_index = 0
+    return family_order, parent, traj_index
+
+
+def _world_nav_group_title(folder_name: str) -> str:
+    if folder_name.startswith("target_"):
+        label = folder_name[len("target_"):].replace("_", " ").strip()
+        return f"WorldNav target {label}"
+    if folder_name.startswith("wonder_"):
+        label = folder_name[len("wonder_"):].replace("_", " ").strip()
+        return f"WorldNav exploration {label}"
+    if folder_name.startswith("reconstruct_"):
+        label = folder_name[len("reconstruct_"):].replace("_", " ").strip()
+        return f"WorldNav reconstruction {label}"
+    return f"WorldNav {folder_name.replace('_', ' ')}"
+
+
+def world_nav_preview_specs(run_dir: Path, apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ) -> list[tuple[str, str, str, str, list[str], str, int]]:
+    if not apply_nav_traj:
+        return []
+
+    render_root = run_dir / "render_results"
+    traj_dirs = sorted(
+        {
+            path
+            for pattern in ("target*/traj*", "wonder*/traj*", "reconstruct*/traj*")
+            for path in render_root.glob(pattern)
+            if path.is_dir()
+        },
+        key=_world_nav_sort_key,
+    )
+    specs: list[tuple[str, str, str, str, list[str], str, int]] = []
+    for group_index, traj_dir in enumerate(traj_dirs):
+        folder_name = traj_dir.parent.name
+        traj_name = traj_dir.name
+        base_rel = traj_dir.relative_to(run_dir).as_posix()
+        folder_rel = traj_dir.parent.relative_to(run_dir).as_posix()
+        group_title = _world_nav_group_title(folder_name)
+        item_prefix = f"worldnav-{folder_name}-{traj_name}"
+        specs.extend(
+            [
+                (
+                    f"{item_prefix}-start",
+                    "world-nav",
+                    f"{group_title} start",
+                    "Start frame for this LLM-planned navigation route.",
+                    [f"{folder_rel}/start_frame.png"],
+                    group_title,
+                    group_index,
+                ),
+                (
+                    f"{item_prefix}-path",
+                    "world-nav",
+                    f"{group_title} path",
+                    "WorldNav path visualization planned from scene analysis.",
+                    [f"{base_rel}/traj_vis.png"],
+                    group_title,
+                    group_index,
+                ),
+                (
+                    f"{item_prefix}-render",
+                    "world-nav",
+                    f"{group_title} render",
+                    "Point-cloud render before video generation for this planned route.",
+                    [f"{base_rel}/render.mp4"],
+                    group_title,
+                    group_index,
+                ),
+                (
+                    f"{item_prefix}-mask",
+                    "world-nav",
+                    f"{group_title} mask",
+                    "Mask for the planned route render; bright regions are supported by projected source points.",
+                    [f"{base_rel}/render_mask.mp4"],
+                    group_title,
+                    group_index,
+                ),
+                (
+                    f"{item_prefix}-generated",
+                    "video",
+                    f"{group_title} generated",
+                    "WorldStereo output used as synthetic training views for this planned route.",
+                    [f"{base_rel}/worldstereo-memory-dmd_result.mp4"],
+                    group_title,
+                    group_index,
+                ),
+            ]
+        )
+    return specs
+
+
 def preview_items(
     job_id: str,
     run_dir: Path,
@@ -427,6 +584,7 @@ def preview_items(
     trajectory_modes: list[str] | None = None,
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS,
     indoor: bool = False,
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for index, (stage, title, description, candidates) in enumerate(PREVIEW_SPECS[:1]):
@@ -434,6 +592,9 @@ def preview_items(
 
     for item_id, stage, title, description, candidates in split_view_preview_specs(split_view_num, trajectory_modes):
         items.append(make_preview_item(job_id, run_dir, item_id, stage, title, description, candidates))
+
+    for item_id, stage, title, description, candidates, group_title, group_order in world_nav_preview_specs(run_dir, apply_nav_traj):
+        items.append(make_preview_item(job_id, run_dir, item_id, stage, title, description, candidates, group_title, group_order))
 
     final_step = gs_final_step(gs_max_steps)
     for index, (stage, title, description, candidates) in enumerate(PREVIEW_SPECS[1:], start=1):
@@ -530,6 +691,8 @@ class Job:
     trajectory_modes: list[str] = field(default_factory=lambda: DEFAULT_TRAJECTORY_MODES.copy())
     indoor: bool = False
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ
+    world_nav_attempts: int = DEFAULT_WORLD_NAV_ATTEMPTS
     prompt_source: str = "unknown"
     prompt_error: str | None = None
     input_hash: str | None = None
@@ -573,6 +736,8 @@ class JobStore:
                     data["trajectory_modes"] = DEFAULT_TRAJECTORY_MODES.copy()
             data.setdefault("indoor", False)
             data.setdefault("gs_max_steps", DEFAULT_GS_MAX_STEPS)
+            data.setdefault("apply_nav_traj", DEFAULT_APPLY_NAV_TRAJ)
+            data.setdefault("world_nav_attempts", DEFAULT_WORLD_NAV_ATTEMPTS)
             data.setdefault("prompt_source", "unknown")
             data.setdefault("prompt_error", None)
             data.setdefault("input_hash", None)
@@ -585,6 +750,10 @@ class JobStore:
                 data["gs_max_steps"] = sanitize_gs_max_steps(data["gs_max_steps"])
             except ValueError:
                 data["gs_max_steps"] = DEFAULT_GS_MAX_STEPS
+            try:
+                data["world_nav_attempts"] = sanitize_world_nav_attempts(data["world_nav_attempts"])
+            except (TypeError, ValueError):
+                data["world_nav_attempts"] = DEFAULT_WORLD_NAV_ATTEMPTS
             job = Job(**data)
             loaded_jobs[job.id] = job
         self.jobs = loaded_jobs
@@ -626,6 +795,8 @@ def make_job_record(
     trajectory_modes: list[str],
     indoor: bool,
     gs_max_steps: int,
+    apply_nav_traj: bool,
+    world_nav_attempts: int,
     input_hash_value: str | None,
     input_image_sha256: str | None,
     input_params: dict[str, Any] | None,
@@ -648,6 +819,8 @@ def make_job_record(
         trajectory_modes=trajectory_modes,
         indoor=indoor,
         gs_max_steps=gs_max_steps,
+        apply_nav_traj=apply_nav_traj,
+        world_nav_attempts=world_nav_attempts,
         prompt_source=prompt_source,
         prompt_error=prompt_error,
         input_hash=input_hash_value,
@@ -687,16 +860,36 @@ class JobManager:
         self.store.save(job)
         self.publish(job.id, {"type": "status", "job": job.public()})
 
-    def start_job(self, job: Job, split_view_num: int, trajectory_modes: list[str], indoor: bool, gs_max_steps: int) -> None:
+    def start_job(
+        self,
+        job: Job,
+        split_view_num: int,
+        trajectory_modes: list[str],
+        indoor: bool,
+        gs_max_steps: int,
+        apply_nav_traj: bool,
+        world_nav_attempts: int,
+    ) -> None:
         job.split_view_num = split_view_num
         job.trajectory_modes = trajectory_modes
         job.indoor = indoor
         job.gs_max_steps = gs_max_steps
+        job.apply_nav_traj = apply_nav_traj
+        job.world_nav_attempts = world_nav_attempts
         job.error = None
         queue_token = self.queue_tokens.get(job.id, 0) + 1
         self.queue_tokens[job.id] = queue_token
         mode_text = ",".join(trajectory_modes)
-        self.update(job, state="queued", stage="queued", progress=f"Waiting for the GPU pipeline. split_view_num={split_view_num}, trajectory_modes={mode_text}, gs_max_steps={gs_max_steps}.")
+        self.update(
+            job,
+            state="queued",
+            stage="queued",
+            progress=(
+                f"Waiting for the GPU pipeline. split_view_num={split_view_num}, "
+                f"trajectory_modes={mode_text}, apply_nav_traj={apply_nav_traj}, "
+                f"world_nav_attempts={world_nav_attempts}, gs_max_steps={gs_max_steps}."
+            ),
+        )
         self.queue.put_nowait((job.id, queue_token))
 
     def update(self, job: Job, *, state: str | None = None, stage: str | None = None, progress: str | None = None, error: str | None = None) -> None:
@@ -716,7 +909,14 @@ class JobManager:
     def refresh_artifacts(self, job: Job) -> None:
         run_dir = Path(job.run_dir)
         artifacts: dict[str, str] = {}
-        for name in ("panorama.png", "point_cloud_7999.spz", "point_cloud_7999.ply", "ckpt_7999_rank0.pt", "pipeline.log"):
+        for name in (
+            "panorama.png",
+            "point_cloud_7999.spz",
+            "point_cloud_7999.ply",
+            "point_cloud_7999_playcanvas.ply",
+            "ckpt_7999_rank0.pt",
+            "pipeline.log",
+        ):
             path, _ = artifact_path(run_dir, name, job.gs_max_steps)
             if path.exists():
                 artifacts[name] = f"/api/jobs/{job.id}/artifacts/{name}"
@@ -739,6 +939,7 @@ class JobManager:
             job.trajectory_modes,
             job.gs_max_steps,
             job.indoor,
+            job.apply_nav_traj,
         )
         return {
             f"{item['id']}|{item.get('path') or ''}|{item.get('updated_at') or ''}"
@@ -754,6 +955,7 @@ class JobManager:
             job.trajectory_modes,
             job.gs_max_steps,
             job.indoor,
+            job.apply_nav_traj,
         )
         current = self.available_preview_signatures(job, items)
         previous = self.preview_signatures.setdefault(job.id, set())
@@ -817,7 +1019,15 @@ class JobManager:
             self.update(job, state="running", stage="prompt synthesis", progress="Generating scene prompt from the uploaded image.")
             await self.synthesize_job_prompt(job)
             self.update(job, stage="starting", progress="Preparing HY-World pipeline.")
-            for stage, cwd, command in pipeline_commands(Path(job.run_dir), job.prompt, job.split_view_num, job.trajectory_modes, job.gs_max_steps):
+            for stage, cwd, command in pipeline_commands(
+                Path(job.run_dir),
+                job.prompt,
+                job.split_view_num,
+                job.trajectory_modes,
+                job.gs_max_steps,
+                job.apply_nav_traj,
+                job.world_nav_attempts,
+            ):
                 if job.state == "canceled":
                     self.update(job, stage="canceled", progress="Job canceled.")
                     return
@@ -841,20 +1051,36 @@ class JobManager:
             self.active_process = None
             self.active_job_id = None
 
-    def expected_trajectory_dirs(self, job: Job) -> list[Path]:
+    def expected_trajectory_dirs(self, job: Job, include_navigation: bool = True) -> list[Path]:
         render_root = Path(job.run_dir) / "render_results"
         modes = sanitize_trajectory_modes(job.trajectory_modes)
-        return [
+        dirs = [
             render_root / f"view{view_i}" / f"traj{traj_i}"
             for view_i in range(max(1, min(int(job.split_view_num), 8)))
             for traj_i in range(len(modes))
         ]
+        if include_navigation and job.apply_nav_traj:
+            dirs.extend(
+                sorted(
+                    path
+                    for pattern in ("target*/traj*", "wonder*/traj*", "reconstruct*/traj*")
+                    for path in render_root.glob(pattern)
+                    if path.is_dir()
+                )
+            )
+        return dirs
 
     def stage_is_complete(self, job: Job, stage: str) -> bool:
         run_dir = Path(job.run_dir)
         traj_dirs = self.expected_trajectory_dirs(job)
         if stage == "trajectory generation":
-            return bool(traj_dirs) and all((path / "camera.json").exists() for path in traj_dirs)
+            regular_dirs = self.expected_trajectory_dirs(job, include_navigation=False)
+            regular_complete = bool(regular_dirs) and all((path / "camera.json").exists() for path in regular_dirs)
+            if not job.apply_nav_traj:
+                return regular_complete
+            nav_dirs = [path for path in traj_dirs if path not in regular_dirs]
+            nav_artifact_exists = (run_dir / "navmesh" / "exploration" / "paths.json").exists()
+            return regular_complete and nav_artifact_exists and bool(nav_dirs) and all((path / "camera.json").exists() for path in nav_dirs)
         if stage == "trajectory rendering":
             return bool(traj_dirs) and all((path / "render.mp4").exists() and (path / "render_mask.mp4").exists() for path in traj_dirs)
         if stage == "caption writing":
@@ -1003,16 +1229,33 @@ def pipeline_commands(
     split_view_num: int = DEFAULT_SPLIT_VIEW_NUM,
     trajectory_modes: list[str] | None = None,
     gs_max_steps: int = DEFAULT_GS_MAX_STEPS,
+    apply_nav_traj: bool = DEFAULT_APPLY_NAV_TRAJ,
+    world_nav_attempts: int | None = DEFAULT_WORLD_NAV_ATTEMPTS,
 ) -> list[tuple[str, Path, list[str]]]:
     scene = str(scene_dir)
     split_views = str(max(1, min(int(split_view_num), 8)))
     modes = ",".join(sanitize_trajectory_modes(trajectory_modes))
     gs_steps = str(sanitize_gs_max_steps(gs_max_steps))
+    trajectory_command = [
+        "python",
+        "traj_generate.py",
+        "--target_path",
+        scene,
+        "--split_view_num",
+        split_views,
+        "--trajectory_modes",
+        modes,
+        "--skip_exist",
+    ]
+    if apply_nav_traj:
+        trajectory_command.append("--apply_nav_traj")
+        selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
+        trajectory_command.extend(["--wonder_topk", str(selected_world_nav_attempts), "--recon_topk", str(selected_world_nav_attempts)])
     return [
         (
             "trajectory generation",
             WORLDGEN_DIR,
-            ["python", "traj_generate.py", "--target_path", scene, "--split_view_num", split_views, "--trajectory_modes", modes, "--skip_exist"],
+            trajectory_command,
         ),
         ("trajectory rendering", WORLDGEN_DIR, ["torchrun", "--nproc_per_node", "1", "traj_render.py", "--target_path", scene, "--skip_exist"]),
         ("caption writing", ROOT_DIR, ["python", "scripts/write_traj_captions.py", "--target-path", scene, "--prompt", prompt]),
@@ -1104,18 +1347,29 @@ async def create_job(
     trajectory_modes: str = Form(",".join(DEFAULT_TRAJECTORY_MODES)),
     indoor: bool = Form(False),
     gs_max_steps: int = Form(DEFAULT_GS_MAX_STEPS),
+    apply_nav_traj: bool = Form(DEFAULT_APPLY_NAV_TRAJ),
+    world_nav_attempts: str | None = Form(str(DEFAULT_WORLD_NAV_ATTEMPTS)),
 ):
     if split_view_num < 1 or split_view_num > 8:
         raise HTTPException(status_code=400, detail="split_view_num must be between 1 and 8.")
     try:
         selected_modes = sanitize_trajectory_modes(trajectory_modes)
         selected_gs_max_steps = sanitize_gs_max_steps(gs_max_steps)
+        selected_world_nav_attempts = sanitize_world_nav_attempts(world_nav_attempts)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    input_hash_value, image_sha256, input_params = task_hash(data, split_view_num, selected_modes, indoor, selected_gs_max_steps)
+    input_hash_value, image_sha256, input_params = task_hash(
+        data,
+        split_view_num,
+        selected_modes,
+        indoor,
+        selected_gs_max_steps,
+        apply_nav_traj,
+        selected_world_nav_attempts,
+    )
     job_id = f"task_{input_hash_value[:20]}"
     run_dir = OUTPUT_ROOT / job_id
 
@@ -1140,6 +1394,8 @@ async def create_job(
         trajectory_modes=selected_modes,
         indoor=indoor,
         gs_max_steps=selected_gs_max_steps,
+        apply_nav_traj=apply_nav_traj,
+        world_nav_attempts=selected_world_nav_attempts,
         input_hash_value=input_hash_value,
         input_image_sha256=image_sha256,
         input_params=input_params,
@@ -1156,6 +1412,8 @@ async def start_job(
     trajectory_modes: str | None = None,
     indoor: bool | None = None,
     gs_max_steps: int | None = None,
+    apply_nav_traj: bool | None = None,
+    world_nav_attempts: str | None = None,
 ):
     job = store.jobs.get(job_id)
     if not job:
@@ -1166,14 +1424,24 @@ async def start_job(
     try:
         selected_modes = sanitize_trajectory_modes(job.trajectory_modes if trajectory_modes is None else trajectory_modes)
         selected_gs_max_steps = sanitize_gs_max_steps(job.gs_max_steps if gs_max_steps is None else gs_max_steps)
+        selected_world_nav_attempts = sanitize_world_nav_attempts(job.world_nav_attempts if world_nav_attempts is None else world_nav_attempts)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     selected_indoor = job.indoor if indoor is None else indoor
+    selected_apply_nav_traj = job.apply_nav_traj if apply_nav_traj is None else apply_nav_traj
 
     if job.input_hash:
         try:
             data = await asyncio.to_thread(uploaded_image_data, Path(job.run_dir))
-            input_hash_value, image_sha256, input_params = task_hash(data, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps)
+            input_hash_value, image_sha256, input_params = task_hash(
+                data,
+                split_view_num,
+                selected_modes,
+                selected_indoor,
+                selected_gs_max_steps,
+                selected_apply_nav_traj,
+                selected_world_nav_attempts,
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not compute task hash: {exc}") from exc
         target_id = f"task_{input_hash_value[:20]}"
@@ -1195,6 +1463,8 @@ async def start_job(
                     trajectory_modes=selected_modes,
                     indoor=selected_indoor,
                     gs_max_steps=selected_gs_max_steps,
+                    apply_nav_traj=selected_apply_nav_traj,
+                    world_nav_attempts=selected_world_nav_attempts,
                     input_hash_value=input_hash_value,
                     input_image_sha256=image_sha256,
                     input_params=input_params,
@@ -1213,7 +1483,7 @@ async def start_job(
     if job.state not in {"ready", "failed", "canceled"}:
         raise HTTPException(status_code=409, detail=f"Job is {job.state}, not startable.")
 
-    manager.start_job(job, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps)
+    manager.start_job(job, split_view_num, selected_modes, selected_indoor, selected_gs_max_steps, selected_apply_nav_traj, selected_world_nav_attempts)
     return job.public()
 
 
@@ -1275,7 +1545,7 @@ async def get_previews(job_id: str):
     job = store.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return preview_items(job.id, Path(job.run_dir), job.split_view_num, job.trajectory_modes, job.gs_max_steps, job.indoor)
+    return preview_items(job.id, Path(job.run_dir), job.split_view_num, job.trajectory_modes, job.gs_max_steps, job.indoor, job.apply_nav_traj)
 
 
 @app.get("/api/jobs/{job_id}/preview-files/{rel_path:path}")

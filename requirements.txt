@@ -12,6 +12,9 @@ fastapi
 uvicorn[standard]
 python-multipart
 pytest
+pytest-cov
+ruff
+tensorly==0.9.0
 
 # Model utilities
 omegaconf
@@ -38,9 +41,10 @@ regex
 
 # Point cloud & 3D
 trimesh
+rtree
 plyfile
 open3d==0.18.0
-pycolmap==3.10.0
+pycolmap @ git+https://github.com/colmap/pycolmap.git@b6627db2266f098c21c3d7e4b7844b4b90d8e02d
 
 # Metrics & logging
 torchmetrics
@@ -51,9 +55,9 @@ tqdm
 viser
 tyro==1.0.8
 splines
-pymeshlab==2023.12.post2
+pymeshlab>=2023.12.post2
 scikit-build-core
 nanobind
-pybind11
+pybind11==2.11.1
 
 numpy==1.26.4

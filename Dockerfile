@@ -5,6 +5,8 @@ FROM ${BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TORCH_CUDA_ARCH_LIST=9.0
 ARG MAX_JOBS=8
+ARG COLMAP_REF=e99036415ec0cf0f75c1d0b8d60fdd91af0d6c68
+ARG PYCOLMAP_REF=b6627db2266f098c21c3d7e4b7844b4b90d8e02d
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -33,23 +35,66 @@ WORKDIR /workspace/HY-World-2.0
 # Source code is mounted at runtime by docker-compose; nothing from the repo is
 # copied into the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        libboost-filesystem-dev \
+        libboost-graph-dev \
+        libboost-iostreams-dev \
+        libboost-program-options-dev \
+        libboost-regex-dev \
+        libboost-serialization-dev \
+        libboost-system-dev \
+        libboost-test-dev \
+        libceres-dev \
+        libeigen3-dev \
+        libflann-dev \
+        libfreeimage-dev \
+        libgflags-dev \
         libglm-dev \
+        libgoogle-glog-dev \
+        liblz4-dev \
+        libmetis-dev \
+        libsqlite3-dev \
+        libspatialindex-dev \
+        libsuitesparse-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --upgrade pip setuptools wheel packaging \
     && python -m pip install \
         "fastapi" \
         "nanobind" \
-        "pybind11" \
+        "pybind11==2.11.1" \
         "pytest" \
+        "pytest-cov" \
         "python-multipart" \
+        "rtree" \
+        "ruff" \
+        "scikit-build-core" \
+        "tensorly==0.9.0" \
         "tensorboard" \
         "transformers[accelerate,tiktoken]==5.2.0" \
         "uvicorn[standard]" \
+    && (python -m pip install "pymeshlab==2023.12.post2" || python -m pip install "pymeshlab==2025.7.post1") \
     && python -m pip install --no-build-isolation \
         "git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787" \
         "git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5" \
         "git+https://github.com/nianticlabs/spz.git@v3.0.0"
+
+RUN git clone https://github.com/colmap/colmap.git /tmp/colmap-src \
+    && cd /tmp/colmap-src \
+    && git checkout "${COLMAP_REF}" \
+    && cmake -S /tmp/colmap-src -B /tmp/colmap-src/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCUDA_ENABLED=OFF \
+        -DGUI_ENABLED=OFF \
+        -DCGAL_ENABLED=OFF \
+        -DTESTS_ENABLED=OFF \
+    && cmake --build /tmp/colmap-src/build --target install --parallel "${MAX_JOBS}" \
+    && git clone --recursive https://github.com/colmap/pycolmap.git /tmp/pycolmap-src \
+    && cd /tmp/pycolmap-src \
+    && git checkout "${PYCOLMAP_REF}" \
+    && git submodule update --init --recursive \
+    && python -m pip install --no-build-isolation /tmp/pycolmap-src \
+    && rm -rf /tmp/colmap-src /tmp/pycolmap-src
 
 RUN python - <<'PY'
 import importlib
@@ -57,7 +102,8 @@ import importlib
 mods = [
     "diffusers", "fastapi", "flash_attn_interface", "fused_ssim",
     "moge", "nanobind", "nerfview", "onnxruntime", "pybind11", "python_multipart",
-    "spz", "tensorboard", "transformers", "uvicorn",
+    "pycolmap", "pymeshlab", "pytest", "pytest_cov", "rtree", "ruff", "spz",
+    "tensorboard", "tensorly", "transformers", "uvicorn",
 ]
 for mod in mods:
     importlib.import_module(mod)

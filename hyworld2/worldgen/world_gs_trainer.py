@@ -40,6 +40,91 @@ from gs.traj import (
 )
 
 
+def _quat_multiply_wxyz(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = left.unbind(dim=-1)
+    w2, x2, y2, z2 = right.unbind(dim=-1)
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dim=-1,
+    )
+
+
+def _rotation_matrix_to_quat_wxyz(matrix: torch.Tensor) -> torch.Tensor:
+    trace = matrix[0, 0] + matrix[1, 1] + matrix[2, 2]
+    if trace > 0:
+        s = torch.sqrt(trace + 1.0) * 2.0
+        quat = matrix.new_tensor([
+            0.25 * s,
+            (matrix[2, 1] - matrix[1, 2]) / s,
+            (matrix[0, 2] - matrix[2, 0]) / s,
+            (matrix[1, 0] - matrix[0, 1]) / s,
+        ])
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = torch.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        quat = matrix.new_tensor([
+            (matrix[2, 1] - matrix[1, 2]) / s,
+            0.25 * s,
+            (matrix[0, 1] + matrix[1, 0]) / s,
+            (matrix[0, 2] + matrix[2, 0]) / s,
+        ])
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = torch.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        quat = matrix.new_tensor([
+            (matrix[0, 2] - matrix[2, 0]) / s,
+            (matrix[0, 1] + matrix[1, 0]) / s,
+            0.25 * s,
+            (matrix[1, 2] + matrix[2, 1]) / s,
+        ])
+    else:
+        s = torch.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        quat = matrix.new_tensor([
+            (matrix[1, 0] - matrix[0, 1]) / s,
+            (matrix[0, 2] + matrix[2, 0]) / s,
+            (matrix[1, 2] + matrix[2, 1]) / s,
+            0.25 * s,
+        ])
+    return F.normalize(quat, p=2, dim=0)
+
+
+def playcanvas_alignment_rotation(
+    up_direction: Union[np.ndarray, torch.Tensor],
+    facing_direction: Union[np.ndarray, torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    up = torch.as_tensor(up_direction, device=device, dtype=dtype)
+    facing = torch.as_tensor(facing_direction, device=device, dtype=dtype)
+    up = F.normalize(up, p=2, dim=0)
+    facing = facing - torch.dot(facing, up) * up
+    facing = F.normalize(facing, p=2, dim=0)
+    right = F.normalize(torch.linalg.cross(facing, up), p=2, dim=0)
+    source_basis = torch.stack([right, up, facing], dim=1)
+    target_basis = torch.eye(3, device=device, dtype=dtype)
+    # PlayCanvas' default asset/camera setup views from +Z toward the origin.
+    # Mapping facing to +Z and up to -Y gives a correctly oriented first import
+    # view while preserving a proper rotation (determinant +1).
+    target_basis[:, 1] = target_basis.new_tensor([0.0, -1.0, 0.0])
+    target_basis[:, 2] = target_basis.new_tensor([0.0, 0.0, 1.0])
+    return target_basis @ source_basis.T
+
+
+def transform_splats_with_rotation(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    rotation: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    rotated_means = means @ rotation.T
+    rotation_quat = _rotation_matrix_to_quat_wxyz(rotation).expand_as(quats)
+    rotated_quats = _quat_multiply_wxyz(rotation_quat, F.normalize(quats, p=2, dim=-1))
+    return rotated_means, F.normalize(rotated_quats, p=2, dim=-1)
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -1562,7 +1647,26 @@ class Runner:
                         format="ply",
                         save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                     )
-
+                    playcanvas_rotation = playcanvas_alignment_rotation(
+                        self.parser.up_direction,
+                        self.parser.facing_direction,
+                        device=means.device,
+                        dtype=means.dtype,
+                    )
+                    playcanvas_means, playcanvas_quats = transform_splats_with_rotation(
+                        means, export_quats, playcanvas_rotation
+                    )
+                    playcanvas_ply_path = f"{self.ply_dir}/point_cloud_{step}_playcanvas.ply"
+                    export_splats(
+                        means=playcanvas_means,
+                        scales=scales,
+                        quats=playcanvas_quats,
+                        opacities=opacities,
+                        sh0=sh0,
+                        shN=shN,
+                        format="ply",
+                        save_to=playcanvas_ply_path,
+                    )
                     # saving position info
                     x_min, x_max = means[:, 0].min().item(), means[:, 0].max().item()
                     y_min, y_max = means[:, 1].min().item(), means[:, 1].max().item()
